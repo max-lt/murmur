@@ -1,0 +1,26 @@
+[package]
+name = "murmur-integration-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[test]]
+name = "two_device_sync"
+path = "two_device_sync.rs"
+
+[[test]]
+name = "three_device_topology"
+path = "three_device_topology.rs"
+
+[[test]]
+name = "scenarios"
+path = "scenarios.rs"
+
+[dependencies]
+murmur-types = { workspace = true }
+murmur-seed = { workspace = true }
+murmur-dag = { workspace = true }
+murmur-engine = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
