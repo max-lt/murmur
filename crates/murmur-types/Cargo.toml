@@ -1,0 +1,13 @@
+[package]
+name = "murmur-types"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

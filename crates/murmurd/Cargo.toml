@@ -1,0 +1,10 @@
+[package]
+name = "murmurd"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+murmur-types = { workspace = true }
+murmur-engine = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

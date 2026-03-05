@@ -1,0 +1,11 @@
+[package]
+name = "murmur-seed"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+murmur-types = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

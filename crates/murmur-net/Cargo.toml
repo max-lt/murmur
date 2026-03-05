@@ -1,0 +1,12 @@
+[package]
+name = "murmur-net"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+murmur-types = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
