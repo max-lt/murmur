@@ -2250,6 +2250,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "murmur-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ed25519-dalek 2.2.0",
+ "murmur-dag",
+ "murmur-engine",
+ "murmur-seed",
+ "murmur-types",
+ "rand 0.8.5",
+]
+
+[[package]]
 name = "murmur-net"
 version = "0.1.0"
 dependencies = [
