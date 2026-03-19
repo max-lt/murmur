@@ -9,7 +9,7 @@ mod storage;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use iced::widget::{button, column, container, horizontal_rule, row, scrollable, text, text_input};
+use iced::widget::{button, column, container, row, rule, scrollable, text, text_input};
 use iced::{Element, Length, Task, Theme};
 
 use murmur_engine::{EngineEvent, MurmurEngine};
@@ -29,7 +29,8 @@ fn main() -> iced::Result {
         )
         .init();
 
-    iced::application("Murmur", App::update, App::view)
+    iced::application(App::default, App::update, App::view)
+        .title("Murmur")
         .theme(App::theme)
         .window_size(iced::Size::new(960.0, 640.0))
         .run()
@@ -255,7 +256,7 @@ impl App {
         let mut col = column![
             title,
             subtitle,
-            horizontal_rule(1),
+            rule::horizontal(1),
             text(mode_label).size(18),
             mode_btn,
             name_input,
@@ -314,7 +315,7 @@ impl App {
         let sidebar = container(
             column![
                 text("Murmur").size(20),
-                horizontal_rule(1),
+                rule::horizontal(1),
                 devices_btn,
                 files_btn,
                 status_btn,
@@ -350,7 +351,7 @@ impl App {
                 .spacing(8);
                 col = col.push(r);
             }
-            col = col.push(horizontal_rule(1));
+            col = col.push(rule::horizontal(1));
         }
 
         col = col.push(text("Approved Devices").size(18));
@@ -391,7 +392,7 @@ impl App {
         ]
         .spacing(8);
         col = col.push(add_row);
-        col = col.push(horizontal_rule(1));
+        col = col.push(rule::horizontal(1));
 
         if self.files.is_empty() {
             col = col.push(text("No files synced yet.").size(14));
@@ -436,7 +437,7 @@ impl App {
             col = col.push(text(format!("Data dir: {}", self.data_dir.display())));
         }
 
-        col = col.push(horizontal_rule(1));
+        col = col.push(rule::horizontal(1));
         col = col.push(text("Event Log").size(18));
 
         if self.event_log.is_empty() {
