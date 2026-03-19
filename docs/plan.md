@@ -17,14 +17,14 @@ For each milestone: implement, test, `cargo clippy -- -D warnings`, `cargo fmt`,
 | 5 — Engine | ✅ Complete |
 | 6 — Server Daemon | ✅ Complete |
 | 7 — Integration Tests | ✅ Complete |
-| 8 — COSMIC Desktop App | 🔲 Next |
-| 9 — FFI Core Library | 🔲 Planned |
+| 8 — COSMIC Desktop App | ✅ Complete |
+| 9 — FFI Core Library | 🔲 Next |
 | 10 — Android App | 🔲 Planned |
 | 11 — iOS App | 🔲 Planned |
 | 12 — Hardening | 🔲 Planned |
 
-The entire Rust core is implemented and tested. The server daemon (`murmurd`) runs as a headless
-backup node. Next step is exposing the core via FFI so mobile platforms can consume it.
+The entire Rust core, server daemon, and COSMIC desktop app are implemented and tested.
+Next step is exposing the core via FFI so mobile platforms can consume it.
 
 ---
 
@@ -559,35 +559,35 @@ crates/murmur-desktop/
     storage.rs      # Fjall + filesystem + DesktopPlatform (PlatformCallbacks)
 ```
 
-- [ ] `iced` application with dark theme (matches COSMIC default)
-- [ ] **Setup screen**: device name input, create/join network toggle, mnemonic
+- [x] `iced` application with dark theme (matches COSMIC default)
+- [x] **Setup screen**: device name input, create/join network toggle, mnemonic
   generation or entry, error display
-- [ ] **Main screen** with sidebar navigation:
+- [x] **Main screen** with sidebar navigation:
   - **Devices tab**: approved device list with revoke, pending requests with approve
   - **Files tab**: file list with metadata, add file by path
   - **Status tab**: device ID, DAG entry count, event log
-- [ ] `DesktopPlatform` — implements `PlatformCallbacks`:
+- [x] `DesktopPlatform` — implements `PlatformCallbacks`:
   - `on_dag_entry` → persist to Fjall
   - `on_blob_received` → write to content-addressed filesystem
   - `on_blob_needed` → read from filesystem (with blake3 verification)
   - `on_event` → push to `Arc<Mutex<Vec<EngineEvent>>>` → UI drains on update
-- [ ] Storage: same Fjall + filesystem pattern as `murmurd`
-- [ ] Persistent config at `~/.murmur-desktop/config.toml`; auto-loads on startup
+- [x] Storage: same Fjall + filesystem pattern as `murmurd`
+- [x] Persistent config at `~/.murmur-desktop/config.toml`; auto-loads on startup
   if already initialized
-- [ ] File add: read from filesystem path, compute blake3, create `FileAdded` DAG entry
+- [x] File add: read from filesystem path, compute blake3, create `FileAdded` DAG entry
 
 **Tests** (≥10):
 
-- [ ] Storage open creates directories
-- [ ] Blob store and load roundtrip
-- [ ] Blob load with blake3 verification
-- [ ] Blob load missing returns None
-- [ ] DAG entry persist and reload
-- [ ] Multiple DAG entries persist across storage reopen
-- [ ] Platform callbacks: on\_dag\_entry persists
-- [ ] Platform callbacks: on\_blob\_received + on\_blob\_needed roundtrip
-- [ ] Platform callbacks: on\_event pushes to event queue
-- [ ] Config file roundtrip (TOML serialize/deserialize)
+- [x] Storage open creates directories
+- [x] Blob store and load roundtrip
+- [x] Blob load with blake3 verification
+- [x] Blob load missing returns None
+- [x] DAG entry persist and reload
+- [x] Multiple DAG entries persist across storage reopen
+- [x] Platform callbacks: on\_dag\_entry persists
+- [x] Platform callbacks: on\_blob\_received + on\_blob\_needed roundtrip
+- [x] Platform callbacks: on\_event pushes to event queue
+- [x] Config file roundtrip (TOML serialize/deserialize)
 
 ---
 

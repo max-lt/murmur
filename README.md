@@ -17,19 +17,19 @@ All mutations (device joins, file additions, access grants) are recorded in a **
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│  Platform (storage, UI, OS integration)     │
-│  murmurd / Android (future) / iOS (future)  │
-├─────────────────────────────────────────────┤
-│  Rust Core (protocol + logic, no storage)   │
-│  ┌─────────────────────────────────────┐    │
-│  │  Engine    — sync, approval, blobs  │    │
-│  │  DAG       — signed append-only log │    │
-│  │  Network   — iroh QUIC + gossip     │    │
-│  │  Seed      — BIP39 + HKDF keys     │    │
-│  │  Types     — DeviceId, BlobHash, …  │    │
-│  └─────────────────────────────────────┘    │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  Platform (storage, UI, OS integration)                     │
+│  murmurd / murmur-desktop / Android (future) / iOS (future) │
+├─────────────────────────────────────────────────────────────┤
+│  Rust Core (protocol + logic, no storage)                   │
+│  ┌─────────────────────────────────────┐                    │
+│  │  Engine    — sync, approval, blobs  │                    │
+│  │  DAG       — signed append-only log │                    │
+│  │  Network   — iroh QUIC + gossip     │                    │
+│  │  Seed      — BIP39 + HKDF keys     │                    │
+│  │  Types     — DeviceId, BlobHash, …  │                    │
+│  └─────────────────────────────────────┘                    │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 The core never writes to disk. It produces serialized bytes and hands them to the platform via callbacks. Each platform decides how to persist (Fjall, SQLite, Core Data, etc.).
@@ -38,24 +38,35 @@ The core never writes to disk. It produces serialized bytes and hands them to th
 
 ```
 crates/
-  murmur-types/    Shared types (DeviceId, BlobHash, NetworkId, HLC, roles)
-  murmur-seed/     BIP39 mnemonic + HKDF key derivation
-  murmur-dag/      Signed append-only DAG (in-memory, platform persists)
-  murmur-net/      iroh QUIC + gossip broadcast
-  murmur-engine/   Orchestrator (sync, approval, blob transfer)
-  murmurd/         Headless backup server daemon
+  murmur-types/      Shared types (DeviceId, BlobHash, NetworkId, HLC, roles)
+  murmur-seed/       BIP39 mnemonic + HKDF key derivation
+  murmur-dag/        Signed append-only DAG (in-memory, platform persists)
+  murmur-net/        iroh QUIC + gossip broadcast
+  murmur-engine/     Orchestrator (sync, approval, blob transfer)
+  murmurd/           Headless backup server daemon (NAS/RPi/VPS)
+  murmur-desktop/    COSMIC/iced desktop GUI app (Pop!_OS and Linux)
 tests/
-  integration/     Multi-device simulation tests
+  integration/       Multi-device simulation tests
 ```
 
 ## Build & test
 
 ```bash
 cargo build                          # build everything
-cargo test                           # all tests (~165)
+cargo test                           # all tests
 cargo test -p murmur-types           # single crate
 cargo clippy -- -D warnings          # lint (must pass, zero warnings)
 cargo fmt --check                    # format check
+```
+
+## Install
+
+```bash
+# Headless backup daemon (NAS, RPi, VPS)
+cargo install --path crates/murmurd
+
+# COSMIC/iced desktop GUI app (Pop!_OS and Linux)
+cargo install --path crates/murmur-desktop
 ```
 
 ## Dependencies
@@ -70,8 +81,9 @@ cargo fmt --check                    # format check
 | Signing        | ed25519-dalek v2   |
 | Serialization  | postcard + serde   |
 | Async          | tokio              |
+| UI (desktop)   | iced 0.13          |
 
-Desktop only (in `murmurd`): fjall v3 (metadata DB), clap (CLI).
+Desktop platforms (`murmurd`, `murmur-desktop`): fjall v3 (metadata DB), clap (CLI).
 
 No dependency requires C/C++ compilation in the core crates.
 
