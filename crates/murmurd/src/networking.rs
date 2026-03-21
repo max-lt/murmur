@@ -6,12 +6,117 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use futures_lite::StreamExt;
 use murmur_dag::DagEntry;
-use murmur_net::MurmurMessage;
+use murmur_types::{Action, BlobHash, DeviceId, GossipMessage, GossipPayload};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+use crate::storage::Storage;
+
+use crate::config::ThrottleConfig;
+use crate::metrics;
+
+/// Maximum blob size before chunked transfer is used.
+const CHUNK_THRESHOLD: usize = 4 * 1024 * 1024; // 4 MB
+
+/// Size of each chunk for large blob transfers.
+const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB
+
+/// Minimum payload size before compression is applied.
+const COMPRESS_THRESHOLD: usize = 256;
+
+/// Compress a gossip wire payload if it exceeds the threshold.
+///
+/// Format: `flag (1 byte) || data`. Flag 0 = raw, flag 1 = deflate-compressed.
+fn compress_wire(data: &[u8]) -> Vec<u8> {
+    if data.len() < COMPRESS_THRESHOLD {
+        let mut out = Vec::with_capacity(1 + data.len());
+        out.push(0); // uncompressed
+        out.extend_from_slice(data);
+        return out;
+    }
+
+    use flate2::Compression;
+    use flate2::write::DeflateEncoder;
+    use std::io::Write;
+
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(data).expect("deflate write");
+    let compressed = encoder.finish().expect("deflate finish");
+
+    // Only use compression if it actually saves space.
+    if compressed.len() < data.len() {
+        let mut out = Vec::with_capacity(1 + compressed.len());
+        out.push(1); // compressed
+        out.extend_from_slice(&compressed);
+        out
+    } else {
+        let mut out = Vec::with_capacity(1 + data.len());
+        out.push(0);
+        out.extend_from_slice(data);
+        out
+    }
+}
+
+/// Decompress a gossip wire payload.
+fn decompress_wire(data: &[u8]) -> Result<Vec<u8>> {
+    if data.is_empty() {
+        anyhow::bail!("empty wire payload");
+    }
+
+    match data[0] {
+        0 => Ok(data[1..].to_vec()),
+        1 => {
+            use flate2::read::DeflateDecoder;
+            use std::io::Read;
+
+            let mut decoder = DeflateDecoder::new(&data[1..]);
+            let mut decompressed = Vec::new();
+            decoder
+                .read_to_end(&mut decompressed)
+                .context("deflate decompress")?;
+            Ok(decompressed)
+        }
+        flag => anyhow::bail!("unknown wire compression flag: {flag}"),
+    }
+}
+
+/// In-progress chunk reassembly buffer for a single blob.
+struct ChunkBuffer {
+    total_chunks: u32,
+    received: HashMap<u32, Vec<u8>>,
+}
+
+impl ChunkBuffer {
+    fn new(total_chunks: u32) -> Self {
+        Self {
+            total_chunks,
+            received: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, index: u32, data: Vec<u8>) {
+        self.received.insert(index, data);
+    }
+
+    fn is_complete(&self) -> bool {
+        self.received.len() == self.total_chunks as usize
+    }
+
+    fn reassemble(self) -> Vec<u8> {
+        let mut indices: Vec<u32> = self.received.keys().copied().collect();
+        indices.sort();
+        let mut out = Vec::new();
+        for i in indices {
+            out.extend_from_slice(&self.received[&i]);
+        }
+        out
+    }
+}
 
 /// Handle returned from [`start_networking`], used to broadcast entries and
 /// query connected peer count.
@@ -20,22 +125,37 @@ pub struct NetworkHandle {
     pub broadcast_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// Number of currently connected gossip peers.
     pub connected_peers: Arc<AtomicU64>,
+    /// Upload rate limiter.
+    #[allow(dead_code)] // Will be wired into blob transfer paths.
+    pub upload_throttle: Arc<TokenBucket>,
     /// The iroh endpoint (kept alive for the duration of the daemon).
-    _endpoint: iroh::Endpoint,
+    endpoint: iroh::Endpoint,
+}
+
+impl NetworkHandle {
+    /// Gracefully close the iroh endpoint, notifying peers.
+    pub async fn close(self) {
+        self.endpoint.close().await;
+        info!("networking stopped");
+    }
 }
 
 /// Start the networking layer: iroh endpoint, gossip subscription, and
 /// background receive/broadcast tasks.
 ///
+/// - `device_id`: this device's ID (included in gossip messages for sender verification).
 /// - `creator_iroh_key_bytes`: 32-byte secret key for the network creator's
 ///   iroh endpoint. All peers derive the same bytes from the mnemonic.
 /// - `is_creator`: whether this device is the network creator.
 /// - `topic`: gossip topic derived from the network ID.
 pub async fn start_networking(
     engine: Arc<Mutex<murmur_engine::MurmurEngine>>,
+    storage: Arc<Storage>,
+    device_id: DeviceId,
     creator_iroh_key_bytes: [u8; 32],
     is_creator: bool,
     topic: iroh_gossip::TopicId,
+    throttle: ThrottleConfig,
 ) -> Result<NetworkHandle> {
     // Derive the creator's endpoint ID (all peers can compute this).
     let creator_secret = iroh::SecretKey::from_bytes(&creator_iroh_key_bytes);
@@ -102,14 +222,22 @@ pub async fn start_networking(
     // Channel for outgoing entries to broadcast.
     let (broadcast_tx, mut broadcast_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    // Broadcast task: reads entry bytes from channel and sends via gossip.
+    // Broadcast task: reads entry bytes from channel, wraps in GossipMessage,
+    // compresses, and sends via gossip.
     let sender_for_broadcast = sender.clone();
+    let device_id_for_broadcast = device_id;
     tokio::spawn(async move {
         while let Some(entry_bytes) = broadcast_rx.recv().await {
-            let msg = MurmurMessage::DagEntryBroadcast { entry_bytes };
-            let payload = msg.to_bytes();
+            let gossip_msg = GossipMessage {
+                nonce: rand::random(),
+                sender: device_id_for_broadcast,
+                payload: GossipPayload::DagEntry { entry_bytes },
+            };
+            let wire_bytes =
+                postcard::to_allocvec(&gossip_msg).expect("GossipMessage serialization");
+            let compressed = compress_wire(&wire_bytes);
             if let Err(e) = sender_for_broadcast
-                .broadcast(bytes::Bytes::from(payload))
+                .broadcast(bytes::Bytes::from(compressed))
                 .await
             {
                 warn!(error = %e, "gossip broadcast failed");
@@ -123,42 +251,55 @@ pub async fn start_networking(
 
     // Receive task: processes incoming gossip events.
     let engine_for_recv = engine.clone();
+    let storage_for_recv = storage.clone();
     let sender_for_recv = sender.clone();
+    let device_id_for_recv = device_id;
     tokio::spawn(async move {
         let engine = engine_for_recv;
+        let mut chunk_buffers: HashMap<BlobHash, ChunkBuffer> = HashMap::new();
         while let Some(event) = receiver.next().await {
             match event {
                 Ok(iroh_gossip::api::Event::Received(msg)) => {
-                    handle_gossip_message(&msg.content, &engine);
+                    let wire_bytes = match decompress_wire(&msg.content) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error = %e, "failed to decompress gossip message");
+                            continue;
+                        }
+                    };
+                    handle_gossip_message(
+                        &wire_bytes,
+                        &engine,
+                        &storage_for_recv,
+                        &sender_for_recv,
+                        device_id_for_recv,
+                        &mut chunk_buffers,
+                    )
+                    .await;
                 }
                 Ok(iroh_gossip::api::Event::NeighborUp(id)) => {
                     let count = peers_for_recv.fetch_add(1, Ordering::Relaxed) + 1;
+                    metrics::set_connected_peers(count);
                     info!(%id, count, "gossip peer connected");
 
-                    // Broadcast all local entries to catch up the new peer.
-                    let payloads: Vec<Vec<u8>> = {
+                    // Send a DagSyncRequest with our tips so peers can compute delta.
+                    let tips: Vec<[u8; 32]> = {
                         let eng = engine.lock().unwrap();
-                        eng.all_entries()
-                            .into_iter()
-                            .map(|entry| {
-                                MurmurMessage::DagEntryBroadcast {
-                                    entry_bytes: entry.to_bytes(),
-                                }
-                                .to_bytes()
-                            })
-                            .collect()
+                        eng.tips().iter().copied().collect()
                     };
-                    for payload in payloads {
-                        if let Err(e) = sender_for_recv.broadcast(bytes::Bytes::from(payload)).await
-                        {
-                            warn!(error = %e, "catch-up broadcast failed");
-                            break;
-                        }
+                    let sync_msg = GossipMessage {
+                        nonce: rand::random(),
+                        sender: device_id_for_recv,
+                        payload: GossipPayload::DagSyncRequest { tips },
+                    };
+                    if let Err(e) = broadcast_gossip(&sender_for_recv, &sync_msg).await {
+                        warn!(error = %e, "sync request broadcast failed");
                     }
-                    info!("broadcast existing entries to new peer");
+                    debug!("sent DagSyncRequest to peers");
                 }
                 Ok(iroh_gossip::api::Event::NeighborDown(id)) => {
                     let count = peers_for_recv.fetch_sub(1, Ordering::Relaxed) - 1;
+                    metrics::set_connected_peers(count);
                     info!(%id, count, "gossip peer disconnected");
                 }
                 Ok(_) => {}
@@ -167,36 +308,199 @@ pub async fn start_networking(
         }
     });
 
-    // Collect existing DAG entries (lock scope) then broadcast.
-    let existing_payloads: Vec<Vec<u8>> = {
+    // On startup, send a DagSyncRequest so existing peers can send us their delta.
+    let initial_tips: Vec<[u8; 32]> = {
         let eng = engine.lock().unwrap();
-        eng.all_entries()
-            .into_iter()
-            .map(|entry| {
-                let msg = MurmurMessage::DagEntryBroadcast {
-                    entry_bytes: entry.to_bytes(),
-                };
-                msg.to_bytes()
-            })
-            .collect()
+        eng.tips().iter().copied().collect()
     };
-    for payload in existing_payloads {
-        if let Err(e) = sender.broadcast(bytes::Bytes::from(payload)).await {
-            debug!(error = %e, "initial broadcast failed (no peers yet)");
-            break;
+    let initial_sync_msg = GossipMessage {
+        nonce: rand::random(),
+        sender: device_id,
+        payload: GossipPayload::DagSyncRequest { tips: initial_tips },
+    };
+    if let Err(e) = broadcast_gossip(&sender, &initial_sync_msg).await {
+        debug!(error = %e, "initial sync request failed (no peers yet)");
+    }
+
+    // Background push-queue retry task: periodically checks the push queue
+    // and broadcasts pending blobs with exponential backoff.
+    let storage_for_push = storage.clone();
+    let sender_for_push = sender.clone();
+    let peers_for_push = connected_peers.clone();
+    tokio::spawn(async move {
+        const CHECK_INTERVAL_SECS: u64 = 10;
+        const BASE_DELAY_SECS: u64 = 5;
+        const MAX_DELAY_SECS: u64 = 30 * 60; // 30 minutes
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(CHECK_INTERVAL_SECS)).await;
+
+            // Only attempt if we have connected peers.
+            if peers_for_push.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+
+            let items = match storage_for_push.push_queue_items() {
+                Ok(items) => items,
+                Err(e) => {
+                    warn!(error = %e, "failed to read push queue");
+                    continue;
+                }
+            };
+
+            if items.is_empty() {
+                continue;
+            }
+
+            debug!(pending = items.len(), "push queue check");
+
+            for (blob_hash, retry_count) in items {
+                // Exponential backoff: skip this item if not enough time has passed.
+                // We approximate by only attempting items whose retry_count maps
+                // to a delay that has elapsed since the last check interval.
+                let delay_secs =
+                    (BASE_DELAY_SECS * 2u64.saturating_pow(retry_count)).min(MAX_DELAY_SECS);
+
+                // Only attempt if enough check intervals have passed for this delay.
+                // This is approximate — we check every CHECK_INTERVAL_SECS.
+                if delay_secs > CHECK_INTERVAL_SECS
+                    && retry_count > 0
+                    && (retry_count as u64 * CHECK_INTERVAL_SECS) < delay_secs
+                {
+                    continue;
+                }
+
+                let data = match storage_for_push.load_blob(blob_hash) {
+                    Ok(Some(data)) => data,
+                    Ok(None) => {
+                        // Blob no longer on disk — remove from queue.
+                        let _ = storage_for_push.push_queue_remove(blob_hash);
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, %blob_hash, "push queue: failed to load blob");
+                        continue;
+                    }
+                };
+
+                let msg = GossipMessage {
+                    nonce: rand::random(),
+                    sender: device_id,
+                    payload: GossipPayload::BlobResponse { blob_hash, data },
+                };
+                match broadcast_gossip(&sender_for_push, &msg).await {
+                    Ok(()) => {
+                        info!(%blob_hash, "push queue: blob broadcast successful, removing");
+                        let _ = storage_for_push.push_queue_remove(blob_hash);
+                    }
+                    Err(e) => {
+                        debug!(error = %e, %blob_hash, retry_count, "push queue: broadcast failed, will retry");
+                        let _ = storage_for_push.push_queue_increment_retry(blob_hash);
+                    }
+                }
+            }
         }
+    });
+
+    let upload_throttle = Arc::new(TokenBucket::new(throttle.max_upload_bytes_per_sec));
+
+    if throttle.max_upload_bytes_per_sec > 0 {
+        info!(
+            rate = throttle.max_upload_bytes_per_sec,
+            "upload bandwidth throttling enabled"
+        );
     }
 
     Ok(NetworkHandle {
         broadcast_tx,
         connected_peers,
-        _endpoint: endpoint,
+        upload_throttle,
+        endpoint,
     })
 }
 
+/// Simple token-bucket rate limiter.
+#[allow(dead_code)] // Will be wired into blob transfer paths.
+pub struct TokenBucket {
+    /// Maximum tokens (bytes) per second.
+    rate: u64,
+    /// Current available tokens.
+    tokens: std::sync::atomic::AtomicI64,
+    /// Last refill instant.
+    last_refill: tokio::sync::Mutex<tokio::time::Instant>,
+}
+
+impl TokenBucket {
+    /// Create a new token bucket. Rate of 0 means unlimited.
+    pub fn new(rate: u64) -> Self {
+        Self {
+            rate,
+            tokens: std::sync::atomic::AtomicI64::new(rate as i64),
+            last_refill: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+        }
+    }
+
+    /// Wait until enough tokens are available for `bytes` bytes.
+    /// No-op if rate is 0 (unlimited).
+    #[allow(dead_code)] // Will be wired into blob transfer paths.
+    pub async fn acquire(&self, bytes: usize) {
+        if self.rate == 0 {
+            return;
+        }
+
+        loop {
+            // Refill tokens based on elapsed time.
+            {
+                let mut last = self.last_refill.lock().await;
+                let now = tokio::time::Instant::now();
+                let elapsed = now.duration_since(*last);
+                let refill = (elapsed.as_secs_f64() * self.rate as f64) as i64;
+                if refill > 0 {
+                    let current = self.tokens.load(Ordering::Relaxed);
+                    let new = (current + refill).min(self.rate as i64);
+                    self.tokens.store(new, Ordering::Relaxed);
+                    *last = now;
+                }
+            }
+
+            let current = self.tokens.load(Ordering::Relaxed);
+            if current >= bytes as i64 {
+                self.tokens.fetch_sub(bytes as i64, Ordering::Relaxed);
+                return;
+            }
+
+            // Wait a short interval before retrying.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// Serialize, compress, and broadcast a GossipMessage.
+async fn broadcast_gossip(
+    gossip_sender: &iroh_gossip::api::GossipSender,
+    msg: &GossipMessage,
+) -> std::result::Result<(), anyhow::Error> {
+    let wire = postcard::to_allocvec(msg).expect("GossipMessage serialization");
+    let compressed = compress_wire(&wire);
+    gossip_sender
+        .broadcast(bytes::Bytes::from(compressed))
+        .await
+        .context("gossip broadcast")
+}
+
 /// Process a single gossip message.
-fn handle_gossip_message(content: &[u8], engine: &Arc<Mutex<murmur_engine::MurmurEngine>>) {
-    let msg = match MurmurMessage::from_bytes(content) {
+///
+/// Deserializes the [`GossipMessage`] envelope, verifies the sender is a
+/// known device (approved or pending), then processes the payload.
+async fn handle_gossip_message(
+    content: &[u8],
+    engine: &Arc<Mutex<murmur_engine::MurmurEngine>>,
+    storage: &Arc<Storage>,
+    gossip_sender: &iroh_gossip::api::GossipSender,
+    our_device_id: DeviceId,
+    chunk_buffers: &mut HashMap<BlobHash, ChunkBuffer>,
+) {
+    let gossip_msg: GossipMessage = match postcard::from_bytes(content) {
         Ok(m) => m,
         Err(e) => {
             warn!(error = %e, "failed to decode gossip message");
@@ -204,8 +508,22 @@ fn handle_gossip_message(content: &[u8], engine: &Arc<Mutex<murmur_engine::Murmu
         }
     };
 
-    match msg {
-        MurmurMessage::DagEntryBroadcast { entry_bytes } => {
+    // Sender verification: reject messages from completely unknown devices.
+    // We allow messages from pending (unapproved) devices because they need
+    // to send DeviceJoinRequest entries.
+    {
+        let eng = engine.lock().unwrap();
+        let sender_known = eng.state().devices.contains_key(&gossip_msg.sender);
+        // Also allow if this is potentially a join request (DAG is small / new network).
+        // The DAG authorization layer provides the definitive check; this is early rejection.
+        if !sender_known && !eng.state().devices.is_empty() {
+            debug!(sender = %gossip_msg.sender, "dropping gossip from unknown device");
+            return;
+        }
+    }
+
+    match gossip_msg.payload {
+        GossipPayload::DagEntry { entry_bytes } => {
             match DagEntry::from_bytes(&entry_bytes) {
                 Ok(entry) => {
                     let hash_short: String = entry
@@ -214,17 +532,236 @@ fn handle_gossip_message(content: &[u8], engine: &Arc<Mutex<murmur_engine::Murmu
                         .take(4)
                         .map(|b| format!("{b:02x}"))
                         .collect();
-                    let mut eng = engine.lock().unwrap();
-                    match eng.receive_entry(entry) {
-                        Ok(_) => info!(hash = %hash_short, "received dag entry via gossip"),
-                        Err(e) => debug!(error = %e, hash = %hash_short, "gossip entry skipped"),
+
+                    // Check if this is a FileAdded entry — we may need to request the blob.
+                    let blob_to_request = if let Action::FileAdded { ref metadata } = entry.action {
+                        let blob_hash = metadata.blob_hash;
+                        match storage.load_blob(blob_hash) {
+                            Ok(Some(_)) => None, // Already have it.
+                            _ => Some(blob_hash),
+                        }
+                    } else {
+                        None
+                    };
+
+                    {
+                        let mut eng = engine.lock().unwrap();
+                        match eng.receive_entry(entry) {
+                            Ok(_) => {
+                                metrics::record_dag_entry();
+                                info!(hash = %hash_short, "received dag entry via gossip");
+                            }
+                            Err(e) => {
+                                debug!(error = %e, hash = %hash_short, "gossip entry skipped");
+                            }
+                        }
+                    }
+
+                    // Request the blob if we don't have it.
+                    if let Some(blob_hash) = blob_to_request {
+                        let req = GossipMessage {
+                            nonce: rand::random(),
+                            sender: our_device_id,
+                            payload: GossipPayload::BlobRequest { blob_hash },
+                        };
+                        if let Err(e) = broadcast_gossip(gossip_sender, &req).await {
+                            warn!(error = %e, %blob_hash, "blob request broadcast failed");
+                        } else {
+                            debug!(%blob_hash, "requested blob from peers");
+                        }
                     }
                 }
                 Err(e) => warn!(error = %e, "invalid dag entry bytes from gossip"),
             }
         }
-        _ => {
-            debug!("ignoring non-dag gossip message");
+        GossipPayload::MembershipEvent { device_id, online } => {
+            debug!(%device_id, online, "membership event");
+        }
+        GossipPayload::DagSyncRequest { tips } => {
+            // Peer is requesting entries they're missing. Compute delta and respond.
+            let remote_tips: std::collections::HashSet<[u8; 32]> = tips.into_iter().collect();
+            let delta_entries: Vec<Vec<u8>> = {
+                let eng = engine.lock().unwrap();
+                eng.compute_delta(&remote_tips)
+                    .into_iter()
+                    .map(|e| e.to_bytes())
+                    .collect()
+            };
+
+            if delta_entries.is_empty() {
+                debug!(sender = %gossip_msg.sender, "sync request: peer is up to date");
+                return;
+            }
+
+            info!(
+                sender = %gossip_msg.sender,
+                entries = delta_entries.len(),
+                "responding to sync request with delta"
+            );
+
+            let response = GossipMessage {
+                nonce: rand::random(),
+                sender: our_device_id,
+                payload: GossipPayload::DagSyncResponse {
+                    entries: delta_entries,
+                },
+            };
+            if let Err(e) = broadcast_gossip(gossip_sender, &response).await {
+                warn!(error = %e, "sync response broadcast failed");
+            }
+        }
+        GossipPayload::DagSyncResponse { entries } => {
+            // Received a batch of entries from a peer's delta computation.
+            info!(count = entries.len(), "received sync response");
+            let sync_start = std::time::Instant::now();
+            let mut eng = engine.lock().unwrap();
+            for entry_bytes in entries {
+                match DagEntry::from_bytes(&entry_bytes) {
+                    Ok(entry) => {
+                        if let Err(e) = eng.receive_entry(entry) {
+                            debug!(error = %e, "sync response entry skipped");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "invalid entry in sync response"),
+                }
+            }
+            metrics::observe_sync_duration(sync_start.elapsed().as_secs_f64());
+        }
+        GossipPayload::BlobRequest { blob_hash } => {
+            // A peer is requesting a blob. If we have it, send it.
+            match storage.load_blob(blob_hash) {
+                Ok(Some(data)) => {
+                    if data.len() <= CHUNK_THRESHOLD {
+                        // Small blob: send as a single response.
+                        metrics::record_blob_transfer_bytes("upload", data.len() as u64);
+                        info!(%blob_hash, size = data.len(), "serving blob to peer");
+                        let response = GossipMessage {
+                            nonce: rand::random(),
+                            sender: our_device_id,
+                            payload: GossipPayload::BlobResponse { blob_hash, data },
+                        };
+                        if let Err(e) = broadcast_gossip(gossip_sender, &response).await {
+                            warn!(error = %e, %blob_hash, "blob response broadcast failed");
+                        }
+                    } else {
+                        // Large blob: send in chunks.
+                        let total_chunks = data.len().div_ceil(CHUNK_SIZE) as u32;
+                        info!(
+                            %blob_hash,
+                            size = data.len(),
+                            total_chunks,
+                            "serving blob in chunks"
+                        );
+                        for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
+                            let msg = GossipMessage {
+                                nonce: rand::random(),
+                                sender: our_device_id,
+                                payload: GossipPayload::BlobChunk {
+                                    blob_hash,
+                                    chunk_index: i as u32,
+                                    total_chunks,
+                                    data: chunk.to_vec(),
+                                },
+                            };
+                            if let Err(e) = broadcast_gossip(gossip_sender, &msg).await {
+                                warn!(
+                                    error = %e,
+                                    %blob_hash,
+                                    chunk = i,
+                                    "chunk broadcast failed"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {
+                    debug!(%blob_hash, "peer requested blob we don't have");
+                }
+                Err(e) => {
+                    warn!(error = %e, %blob_hash, "error loading blob for peer request");
+                }
+            }
+        }
+        GossipPayload::BlobResponse { blob_hash, data } => {
+            if data.is_empty() {
+                debug!(%blob_hash, "received empty blob response");
+                return;
+            }
+
+            // Verify integrity before storing.
+            let actual_hash = BlobHash::from_data(&data);
+            if actual_hash != blob_hash {
+                warn!(
+                    expected = %blob_hash,
+                    actual = %actual_hash,
+                    "blob integrity check failed, rejecting"
+                );
+                return;
+            }
+
+            // Only store if we don't already have it.
+            match storage.load_blob(blob_hash) {
+                Ok(Some(_)) => {
+                    debug!(%blob_hash, "already have this blob, skipping");
+                }
+                _ => {
+                    if let Err(e) = storage.store_blob(blob_hash, &data) {
+                        warn!(error = %e, %blob_hash, "failed to store received blob");
+                    } else {
+                        metrics::record_blob_transfer_bytes("download", data.len() as u64);
+                        info!(%blob_hash, size = data.len(), "blob received and stored");
+                    }
+                }
+            }
+        }
+        GossipPayload::BlobChunk {
+            blob_hash,
+            chunk_index,
+            total_chunks,
+            data,
+        } => {
+            debug!(
+                %blob_hash,
+                chunk = chunk_index,
+                total = total_chunks,
+                size = data.len(),
+                "received blob chunk"
+            );
+
+            let buffer = chunk_buffers
+                .entry(blob_hash)
+                .or_insert_with(|| ChunkBuffer::new(total_chunks));
+
+            buffer.insert(chunk_index, data);
+
+            if buffer.is_complete() {
+                let buffer = chunk_buffers.remove(&blob_hash).unwrap();
+                let full_data = buffer.reassemble();
+
+                // Verify full blob hash.
+                let actual_hash = BlobHash::from_data(&full_data);
+                if actual_hash != blob_hash {
+                    warn!(
+                        expected = %blob_hash,
+                        actual = %actual_hash,
+                        "chunked blob integrity check failed"
+                    );
+                    return;
+                }
+
+                if let Err(e) = storage.store_blob(blob_hash, &full_data) {
+                    warn!(error = %e, %blob_hash, "failed to store reassembled blob");
+                } else {
+                    metrics::record_blob_transfer_bytes("download", full_data.len() as u64);
+                    info!(
+                        %blob_hash,
+                        size = full_data.len(),
+                        chunks = total_chunks,
+                        "chunked blob reassembled and stored"
+                    );
+                }
+            }
         }
     }
 }

@@ -62,6 +62,8 @@ pub enum CliRequest {
         /// Filesystem path to the file.
         path: String,
     },
+    /// Query in-flight blob transfer status.
+    TransferStatus,
 }
 
 /// A response sent from `murmurd` to `murmur-cli`.
@@ -107,6 +109,11 @@ pub enum CliResponse {
         /// Human-readable message.
         message: String,
     },
+    /// In-flight blob transfer status.
+    TransferStatus {
+        /// Active transfers.
+        transfers: Vec<TransferInfoIpc>,
+    },
     /// Operation failed.
     Error {
         /// Human-readable error message.
@@ -140,6 +147,17 @@ pub struct FileInfoIpc {
     pub mime_type: Option<String>,
     /// Origin device ID (hex).
     pub device_origin: String,
+}
+
+/// Blob transfer status for IPC transport.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TransferInfoIpc {
+    /// Blob hash (hex).
+    pub blob_hash: String,
+    /// Bytes transferred so far.
+    pub bytes_transferred: u64,
+    /// Total blob size in bytes.
+    pub total_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +273,7 @@ mod tests {
             CliRequest::AddFile {
                 path: "/tmp/file.txt".to_string(),
             },
+            CliRequest::TransferStatus,
         ];
         for req in variants {
             let bytes = postcard::to_allocvec(&req).unwrap();
@@ -328,6 +347,13 @@ mod tests {
             CliResponse::Files { files: vec![] },
             CliResponse::Ok {
                 message: "done".to_string(),
+            },
+            CliResponse::TransferStatus {
+                transfers: vec![TransferInfoIpc {
+                    blob_hash: "dd".repeat(32),
+                    bytes_transferred: 512,
+                    total_bytes: 1024,
+                }],
             },
             CliResponse::Error {
                 message: "failed".to_string(),

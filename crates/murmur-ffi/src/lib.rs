@@ -133,6 +133,12 @@ pub enum MurmurEventFfi {
     NetworkCreated { device_id: Vec<u8> },
     /// This device joined an existing network.
     NetworkJoined { device_id: Vec<u8> },
+    /// Progress update for an in-flight blob transfer.
+    BlobTransferProgress {
+        blob_hash: Vec<u8>,
+        bytes_transferred: u64,
+        total_bytes: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +211,15 @@ fn engine_event_to_ffi(event: EngineEvent) -> MurmurEventFfi {
         },
         EngineEvent::NetworkJoined { device_id } => MurmurEventFfi::NetworkJoined {
             device_id: device_id.as_bytes().to_vec(),
+        },
+        EngineEvent::BlobTransferProgress {
+            blob_hash,
+            bytes_transferred,
+            total_bytes,
+        } => MurmurEventFfi::BlobTransferProgress {
+            blob_hash: blob_hash.as_bytes().to_vec(),
+            bytes_transferred,
+            total_bytes,
         },
     }
 }

@@ -15,4 +15,12 @@ pub enum DagError {
     /// Deserialization failed.
     #[error("deserialization: {0}")]
     Deserialization(String),
+    /// The signing device is not authorized to perform this action.
+    #[error("unauthorized: device {device_id} cannot perform {action}")]
+    Unauthorized {
+        /// Hex-encoded device ID.
+        device_id: String,
+        /// Description of the action attempted.
+        action: String,
+    },
 }

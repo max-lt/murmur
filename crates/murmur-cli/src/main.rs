@@ -75,6 +75,8 @@ enum Command {
         /// Path to the file to add.
         path: String,
     },
+    /// Show in-flight blob transfer status.
+    Transfers,
 }
 
 fn main() {
@@ -121,6 +123,7 @@ fn run_online(base_dir: &std::path::Path, command: Command, json: bool) -> Resul
         Command::Mnemonic => CliRequest::ShowMnemonic,
         Command::Files => CliRequest::ListFiles,
         Command::Add { path } => CliRequest::AddFile { path },
+        Command::Transfers => CliRequest::TransferStatus,
         // Join is handled before we get here.
         Command::Join { .. } => unreachable!(),
     };
@@ -202,6 +205,24 @@ fn print_plain(response: &CliResponse) {
                     println!(
                         "  {} {} ({} bytes, {mime})",
                         f.blob_hash, f.filename, f.size
+                    );
+                }
+            }
+        }
+        CliResponse::TransferStatus { transfers } => {
+            if transfers.is_empty() {
+                println!("No active transfers.");
+            } else {
+                println!("Pending transfers ({}):", transfers.len());
+                for t in transfers {
+                    let pct = if t.total_bytes > 0 {
+                        (t.bytes_transferred as f64 / t.total_bytes as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "  {} {}/{} bytes ({pct:.0}%)",
+                        t.blob_hash, t.bytes_transferred, t.total_bytes
                     );
                 }
             }

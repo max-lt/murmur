@@ -4,6 +4,11 @@
 //! `murmur-cli` which connects over a Unix domain socket.
 
 mod config;
+mod crypto;
+#[cfg(feature = "metrics")]
+mod http;
+mod mdns;
+mod metrics;
 mod networking;
 mod storage;
 
@@ -15,10 +20,11 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use murmur_ipc::{CliRequest, CliResponse, DeviceInfoIpc, FileInfoIpc};
+use murmur_ipc::{CliRequest, CliResponse, DeviceInfoIpc, FileInfoIpc, TransferInfoIpc};
 use murmur_types::DeviceId;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+use zeroize::Zeroize;
 
 use config::Config;
 use storage::{FjallPlatform, Storage};
@@ -49,6 +55,10 @@ struct Cli {
     /// Increase log verbosity (debug level).
     #[arg(long, short)]
     verbose: bool,
+
+    /// Enable HTTP health/metrics endpoint on this port (requires `metrics` feature).
+    #[arg(long)]
+    http_port: Option<u16>,
 }
 
 // ---------------------------------------------------------------------------
@@ -66,7 +76,7 @@ fn main() -> Result<()> {
         )
         .init();
 
-    run_daemon(&cli.data_dir, &cli.name, &cli.role)
+    run_daemon(&cli.data_dir, &cli.name, &cli.role, cli.http_port)
 }
 
 // ---------------------------------------------------------------------------
@@ -77,7 +87,12 @@ fn main() -> Result<()> {
 ///
 /// On first run (no config.toml), automatically creates a new network,
 /// generates a mnemonic, writes config, and prints the mnemonic.
-fn run_daemon(base_dir: &Path, default_name: &str, default_role: &str) -> Result<()> {
+fn run_daemon(
+    base_dir: &Path,
+    default_name: &str,
+    default_role: &str,
+    http_port: Option<u16>,
+) -> Result<()> {
     let config_path = Config::config_path(base_dir);
 
     // Auto-initialize on first run.
@@ -88,19 +103,22 @@ fn run_daemon(base_dir: &Path, default_name: &str, default_role: &str) -> Result
 
     let config = Config::load(&config_path).context("load config")?;
 
-    // Load mnemonic.
-    let mnemonic_str =
+    // Load mnemonic. Zeroize the raw string after parsing.
+    let mut mnemonic_str =
         std::fs::read_to_string(Config::mnemonic_path(base_dir)).context("read mnemonic")?;
     let mnemonic = murmur_seed::parse_mnemonic(mnemonic_str.trim())?;
+    mnemonic_str.zeroize();
     let identity = murmur_seed::NetworkIdentity::from_mnemonic(&mnemonic, "");
 
-    // Determine device key.
+    // Determine device key. Zeroize raw key bytes after use.
     let device_key_path = Config::device_key_path(base_dir);
     let (device_id, signing_key) = if device_key_path.exists() {
-        let bytes: [u8; 32] = std::fs::read(&device_key_path)
-            .context("read device key")?
+        let mut raw_bytes = std::fs::read(&device_key_path).context("read device key")?;
+        let bytes: [u8; 32] = raw_bytes
+            .clone()
             .try_into()
             .map_err(|_| anyhow::anyhow!("device key file must be 32 bytes"))?;
+        raw_bytes.zeroize();
         let kp = murmur_seed::DeviceKeyPair::from_bytes(bytes);
         (kp.device_id(), kp.signing_key().clone())
     } else {
@@ -110,11 +128,11 @@ fn run_daemon(base_dir: &Path, default_name: &str, default_role: &str) -> Result
         )
     };
 
-    // Open storage.
-    let storage = Arc::new(Storage::open(
-        &config.storage.data_dir,
-        &config.storage.blob_dir,
-    )?);
+    // Open storage with blob encryption.
+    let mut storage_inner = Storage::open(&config.storage.data_dir, &config.storage.blob_dir)?;
+    let blob_enc_key = identity.blob_encryption_key();
+    storage_inner.set_blob_encryption_key(&blob_enc_key);
+    let storage = Arc::new(storage_inner);
     let platform = Arc::new(FjallPlatform::new(storage.clone()));
 
     // Create engine.
@@ -135,6 +153,21 @@ fn run_daemon(base_dir: &Path, default_name: &str, default_role: &str) -> Result
         if let Err(e) = engine.load_entry_bytes(&entry_bytes) {
             warn!(error = %e, "skip loading dag entry");
         }
+    }
+
+    // Verify blob integrity on startup.
+    let corrupted = storage.verify_all_blobs()?;
+    if !corrupted.is_empty() {
+        warn!(
+            count = corrupted.len(),
+            "corrupted blobs detected — these may need to be re-synced"
+        );
+    }
+
+    // Set initial metrics from loaded state.
+    metrics::set_connected_peers(0);
+    if let Ok(items) = storage.push_queue_items() {
+        metrics::set_blobs_pending_sync(items.len() as u64);
     }
 
     info!(%device_id, name = %config.device.name, "daemon started");
@@ -162,12 +195,51 @@ fn run_daemon(base_dir: &Path, default_name: &str, default_role: &str) -> Result
         let topic = murmur_net::topic_from_network_id(&network_id);
         let creator_iroh_key = identity.creator_iroh_key_bytes();
 
-        let net_handle =
-            networking::start_networking(engine.clone(), creator_iroh_key, is_creator, topic)
-                .await
-                .context("start networking")?;
+        let net_handle = networking::start_networking(
+            engine.clone(),
+            storage.clone(),
+            device_id,
+            creator_iroh_key,
+            is_creator,
+            topic,
+            config.network.throttle.clone(),
+        )
+        .await
+        .context("start networking")?;
 
         info!("gossip networking started");
+
+        // Optionally start HTTP health/metrics server.
+        #[cfg(feature = "metrics")]
+        if let Some(port) = http_port {
+            let http_state = http::server::HttpState {
+                engine: engine.clone(),
+                storage: storage.clone(),
+                connected_peers: net_handle.connected_peers.clone(),
+                start_time,
+            };
+            tokio::spawn(http::server::start_http_server(http_state, port));
+        }
+        #[cfg(not(feature = "metrics"))]
+        if http_port.is_some() {
+            warn!("--http-port requires the `metrics` feature; ignoring");
+        }
+
+        // Optionally start mDNS LAN peer discovery.
+        let _mdns_handle = if config.network.mdns {
+            match mdns::start_mdns(&network_id, 0, net_handle.connected_peers.clone()) {
+                Ok(handle) => {
+                    info!("mDNS peer discovery enabled");
+                    Some(handle)
+                }
+                Err(e) => {
+                    warn!(error = %e, "mDNS startup failed, continuing without it");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Spawn a task to accept socket connections.
         let ctx = Arc::new(DaemonCtx {
@@ -201,20 +273,45 @@ fn run_daemon(base_dir: &Path, default_name: &str, default_role: &str) -> Result
             }
         });
 
-        // Wait for shutdown signal.
-        tokio::signal::ctrl_c().await.context("listen for ctrl-c")?;
-        info!("shutdown signal received");
+        // Wait for shutdown signal (SIGINT or SIGTERM).
+        let shutdown = async {
+            let ctrl_c = tokio::signal::ctrl_c();
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .context("register SIGTERM handler")?;
+                tokio::select! {
+                    _ = ctrl_c => info!("received SIGINT"),
+                    _ = sigterm.recv() => info!("received SIGTERM"),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                ctrl_c.await.context("listen for ctrl-c")?;
+                info!("received SIGINT");
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+
+        shutdown.await?;
+        info!("shutting down…");
 
         // Abort the accept loop (drop the listener).
         accept_handle.abort();
 
-        // Drop the network handle to clean up.
-        drop(net_handle);
+        // Stop mDNS if running.
+        if let Some(handle) = _mdns_handle {
+            handle.shutdown();
+        }
+
+        // Close the iroh endpoint gracefully so peers see us leave.
+        net_handle.close().await;
 
         Ok::<(), anyhow::Error>(())
     })?;
 
-    // Cleanup.
+    // Cleanup: flush storage and remove socket.
     storage.flush()?;
     let _ = std::fs::remove_file(&sock_path);
     info!("daemon stopped");
@@ -365,6 +462,32 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 .collect();
             CliResponse::Files { files }
         }
+        CliRequest::TransferStatus => {
+            let items = match ctx.storage.push_queue_items() {
+                Ok(items) => items,
+                Err(e) => {
+                    return CliResponse::Error {
+                        message: format!("read push queue: {e}"),
+                    };
+                }
+            };
+            let transfers = items
+                .into_iter()
+                .map(|(blob_hash, _retry_count)| {
+                    // Check blob size on disk for total_bytes.
+                    let total_bytes = match ctx.storage.load_blob(blob_hash) {
+                        Ok(Some(data)) => data.len() as u64,
+                        _ => 0,
+                    };
+                    TransferInfoIpc {
+                        blob_hash: blob_hash.to_string(),
+                        bytes_transferred: 0, // pending = not yet transferred
+                        total_bytes,
+                    }
+                })
+                .collect();
+            CliResponse::TransferStatus { transfers }
+        }
         CliRequest::AddFile { path } => {
             let file_path = std::path::Path::new(&path);
             if !file_path.exists() {
@@ -403,6 +526,10 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
             match eng.add_file(metadata, data) {
                 Ok(entry) => {
                     let _ = ctx.broadcast_tx.send(entry.to_bytes());
+                    // Enqueue blob for push sync to peers.
+                    if let Err(e) = ctx.storage.push_queue_add(blob_hash) {
+                        error!(error = %e, "enqueue blob for push");
+                    }
                     if let Err(e) = ctx.storage.flush() {
                         error!(error = %e, "flush after add_file");
                     }
@@ -882,6 +1009,19 @@ mod tests {
 
         let config = Config::load(&Config::config_path(dir.path())).unwrap();
         assert_eq!(config.device.name, "First");
+    }
+
+    #[test]
+    fn test_process_request_transfer_status_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let resp = process_request(CliRequest::TransferStatus, &ctx);
+
+        match resp {
+            CliResponse::TransferStatus { transfers } => assert!(transfers.is_empty()),
+            other => panic!("expected TransferStatus, got {other:?}"),
+        }
     }
 
     #[test]

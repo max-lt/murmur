@@ -240,6 +240,24 @@ pub enum Action {
     },
 }
 
+impl Action {
+    /// Return a human-readable name for this action variant (for error messages).
+    pub fn action_name(&self) -> &'static str {
+        match self {
+            Action::DeviceJoinRequest { .. } => "DeviceJoinRequest",
+            Action::DeviceApproved { .. } => "DeviceApproved",
+            Action::DeviceRevoked { .. } => "DeviceRevoked",
+            Action::DeviceNameChanged { .. } => "DeviceNameChanged",
+            Action::FileAdded { .. } => "FileAdded",
+            Action::FileDeleted { .. } => "FileDeleted",
+            Action::AccessGranted { .. } => "AccessGranted",
+            Action::AccessRevoked { .. } => "AccessRevoked",
+            Action::Merge => "Merge",
+            Action::Snapshot { .. } => "Snapshot",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Hybrid Logical Clock
 // ---------------------------------------------------------------------------
@@ -337,17 +355,53 @@ pub enum GossipPayload {
         /// Whether the device is now online.
         online: bool,
     },
+    /// Request missing DAG entries from a peer.
+    DagSyncRequest {
+        /// The requester's current tip hashes.
+        tips: Vec<[u8; 32]>,
+    },
+    /// Response with missing DAG entries (delta).
+    DagSyncResponse {
+        /// Serialized DAG entries (each as postcard bytes) in topological order.
+        entries: Vec<Vec<u8>>,
+    },
+    /// Request a blob from peers.
+    BlobRequest {
+        /// Content hash of the requested blob.
+        blob_hash: BlobHash,
+    },
+    /// Response with blob data (for small blobs, or when chunking is not needed).
+    BlobResponse {
+        /// Content hash of the blob.
+        blob_hash: BlobHash,
+        /// Blob data (empty if sender doesn't have it).
+        data: Vec<u8>,
+    },
+    /// A chunk of a large blob being transferred.
+    BlobChunk {
+        /// Content hash of the full blob.
+        blob_hash: BlobHash,
+        /// Zero-based chunk index.
+        chunk_index: u32,
+        /// Total number of chunks.
+        total_chunks: u32,
+        /// Chunk data.
+        data: Vec<u8>,
+    },
 }
 
 /// Wire envelope for gossip messages.
 ///
 /// Wraps a [`GossipPayload`] with a random nonce so that PlumTree
 /// (iroh-gossip) never deduplicates two distinct broadcasts that happen
-/// to have identical payload bytes.
+/// to have identical payload bytes. The `sender` field identifies the
+/// originating device for pre-DAG authentication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GossipMessage {
     /// Random nonce to guarantee byte-level uniqueness.
     pub nonce: u64,
+    /// The device that originated this message.
+    pub sender: DeviceId,
     /// The actual payload.
     pub payload: GossipPayload,
 }
@@ -720,6 +774,7 @@ mod tests {
     fn test_gossip_message_roundtrip() {
         let msg = GossipMessage {
             nonce: 42,
+            sender: DeviceId::from_data(b"test-sender"),
             payload: GossipPayload::DagEntry {
                 entry_bytes: vec![10, 20],
             },

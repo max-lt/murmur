@@ -684,11 +684,16 @@ mod tests {
     #[test]
     fn test_receive_entry() {
         let (mut engine1, _cb1) = make_engine("NAS");
-        let (mut engine2, cb2) = make_engine("Phone");
+        let (id2, sk2) = make_keypair();
+        let cb2 = Arc::new(TestCallbacks::default());
 
-        // Sync founding entries first so engine2 has engine1's parents.
-        let pre_delta = engine1.compute_delta(engine2.tips());
-        engine2.receive_sync_entries(pre_delta).unwrap();
+        // Engine1 approves device2.
+        engine1.approve_device(id2, DeviceRole::Source).unwrap();
+
+        // Engine2 joins as a fresh DAG and syncs engine1's entries.
+        let mut engine2 = MurmurEngine::from_dag(Dag::new(id2, sk2), cb2.clone());
+        let pre_entries = engine1.all_entries();
+        engine2.receive_sync_entries(pre_entries).unwrap();
 
         let (meta, data) = make_file_data(b"sync me");
         let entry = engine1.add_file(meta, data).unwrap();
@@ -728,7 +733,15 @@ mod tests {
     #[test]
     fn test_two_devices_add_files_concurrently() {
         let (mut engine1, _cb1) = make_engine("NAS");
-        let (mut engine2, _cb2) = make_engine("Phone");
+        let (id2, sk2) = make_keypair();
+        let cb2 = Arc::new(TestCallbacks::default());
+
+        // Engine1 approves device2.
+        engine1.approve_device(id2, DeviceRole::Source).unwrap();
+
+        // Engine2 joins and syncs engine1's entries.
+        let mut engine2 = MurmurEngine::from_dag(Dag::new(id2, sk2), cb2);
+        engine2.receive_sync_entries(engine1.all_entries()).unwrap();
 
         let (meta1, data1) = make_file_data(b"file from NAS");
         engine1.add_file(meta1.clone(), data1).unwrap();
@@ -779,7 +792,15 @@ mod tests {
     #[test]
     fn test_maybe_merge() {
         let (mut engine1, _cb1) = make_engine("NAS");
-        let (mut engine2, _cb2) = make_engine("Phone");
+        let (id2, sk2) = make_keypair();
+        let cb2 = Arc::new(TestCallbacks::default());
+
+        // Engine1 approves device2.
+        engine1.approve_device(id2, DeviceRole::Source).unwrap();
+
+        // Engine2 joins and syncs.
+        let mut engine2 = MurmurEngine::from_dag(Dag::new(id2, sk2), cb2);
+        engine2.receive_sync_entries(engine1.all_entries()).unwrap();
 
         let (meta1, data1) = make_file_data(b"a");
         engine1.add_file(meta1, data1).unwrap();
@@ -787,7 +808,7 @@ mod tests {
         let (meta2, data2) = make_file_data(b"b");
         engine2.add_file(meta2, data2).unwrap();
 
-        // Sync engine2's entries into engine1 → creates 2 tips.
+        // Sync engine2's entries into engine1 → creates 2+ tips.
         let delta = engine2.compute_delta(engine1.tips());
         engine1.receive_sync_entries(delta).unwrap();
 

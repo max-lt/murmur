@@ -61,4 +61,13 @@ pub enum EngineEvent {
         /// This device's ID.
         device_id: DeviceId,
     },
+    /// Progress update for an in-flight blob transfer.
+    BlobTransferProgress {
+        /// The blob being transferred.
+        blob_hash: BlobHash,
+        /// Bytes transferred so far.
+        bytes_transferred: u64,
+        /// Total blob size.
+        total_bytes: u64,
+    },
 }

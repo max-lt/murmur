@@ -315,9 +315,11 @@ fn test_dag_convergence_after_partition() {
 #[test]
 fn test_dag_convergence_many_entries() {
     let (mut a, _) = create_engine("A", DeviceRole::Full);
-    let (mut b, _) = create_engine("B", DeviceRole::Full);
+    let (mut b, _, id_b) = join_engine("B");
     let id_a = a.device_id();
-    let id_b = b.device_id();
+
+    // A approves B and they sync.
+    join_approve_sync(&mut a, &mut b, id_b, DeviceRole::Full);
 
     // Each adds 10 files independently.
     for i in 0..10 {

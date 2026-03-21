@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use murmur_types::{AccessGrant, Action, BlobHash, DeviceId, DeviceInfo, DeviceRole, FileMetadata};
+use serde::{Deserialize, Serialize};
 
 use crate::DagEntry;
 
@@ -11,7 +12,7 @@ use crate::DagEntry;
 /// This is the "current view" of the network: which devices exist, what files
 /// are tracked, and which access grants are active. It is always reconstructible
 /// from the DAG entries.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MaterializedState {
     /// All known devices and their status.
     pub devices: BTreeMap<DeviceId, DeviceInfo>,
@@ -25,6 +26,21 @@ impl MaterializedState {
     /// Create a new empty state.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Serialize the state to bytes (postcard).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).expect("MaterializedState serialization")
+    }
+
+    /// Deserialize from bytes (postcard).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, crate::DagError> {
+        postcard::from_bytes(bytes).map_err(|e| crate::DagError::Deserialization(e.to_string()))
+    }
+
+    /// Compute the blake3 hash of the serialized state.
+    pub fn state_hash(&self) -> [u8; 32] {
+        *blake3::hash(&self.to_bytes()).as_bytes()
     }
 
     /// Apply a single DAG entry to the state.

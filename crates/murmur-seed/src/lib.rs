@@ -19,6 +19,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use murmur_types::{DeviceId, NetworkId};
 use sha2::Sha256;
+use zeroize::Zeroize;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -94,13 +95,24 @@ fn hkdf_derive_32(seed: &[u8], info: &str) -> [u8; 32] {
 ///
 /// Includes the network ID, ALPN protocol string, and the first device's
 /// signing key. Created via [`NetworkIdentity::from_mnemonic`].
+///
+/// Sensitive key material is zeroed from memory when this struct is dropped.
 pub struct NetworkIdentity {
     /// Unique identifier for this network.
     network_id: NetworkId,
     /// QUIC ALPN protocol string for network isolation.
     alpn: Vec<u8>,
     /// Ed25519 signing key for the first device in the network.
+    /// `SigningKey` already implements `Zeroize`.
     first_device_key: SigningKey,
+}
+
+impl Drop for NetworkIdentity {
+    fn drop(&mut self) {
+        // SigningKey auto-zeroes on drop via ed25519-dalek's ZeroizeOnDrop impl.
+        // Zero the ALPN bytes too (contains network-derived info).
+        self.alpn.zeroize();
+    }
 }
 
 impl NetworkIdentity {
@@ -113,16 +125,18 @@ impl NetworkIdentity {
     /// Derive a full network identity from a raw 64-byte BIP39 seed.
     pub fn from_seed(seed: &[u8]) -> Self {
         // Network ID: HKDF → blake3
-        let network_id_raw = hkdf_derive_32(seed, "murmur/network-id");
+        let mut network_id_raw = hkdf_derive_32(seed, "murmur/network-id");
         let network_id = NetworkId::from_bytes(*blake3::hash(&network_id_raw).as_bytes());
+        network_id_raw.zeroize();
 
         // ALPN: "murmur/0/" + first 16 hex chars of network_id
         let hex_prefix: String = network_id.to_string().chars().take(16).collect();
         let alpn = format!("murmur/0/{hex_prefix}").into_bytes();
 
         // First device key: HKDF → Ed25519 signing key
-        let key_bytes = hkdf_derive_32(seed, "murmur/first-device-key");
+        let mut key_bytes = hkdf_derive_32(seed, "murmur/first-device-key");
         let first_device_key = SigningKey::from_bytes(&key_bytes);
+        key_bytes.zeroize();
 
         Self {
             network_id,
@@ -170,6 +184,18 @@ impl NetworkIdentity {
             .expect("32 bytes is valid HKDF-SHA256 output");
         out
     }
+
+    /// Derive 32 bytes for AES-256-GCM blob encryption at rest.
+    ///
+    /// All devices in the same network derive the same key, so blobs
+    /// encrypted on one device can be decrypted on another.
+    pub fn blob_encryption_key(&self) -> [u8; 32] {
+        let hk = Hkdf::<Sha256>::new(None, self.network_id.as_bytes());
+        let mut out = [0u8; 32];
+        hk.expand(b"murmur/blob-encryption-key", &mut out)
+            .expect("32 bytes is valid HKDF-SHA256 output");
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -180,9 +206,13 @@ impl NetworkIdentity {
 ///
 /// Generated randomly. The first device uses the seed-derived key from
 /// [`NetworkIdentity::first_device_signing_key`] instead.
+///
+/// Signing key material is zeroed from memory when this struct is dropped.
 pub struct DeviceKeyPair {
     signing_key: SigningKey,
 }
+
+// DeviceKeyPair: SigningKey auto-zeroes on drop via ed25519-dalek's ZeroizeOnDrop impl.
 
 impl DeviceKeyPair {
     /// Generate a new random device keypair.

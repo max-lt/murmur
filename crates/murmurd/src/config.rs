@@ -40,6 +40,25 @@ pub struct NetworkConfig {
     /// Automatically approve new devices with the correct network ID.
     #[serde(default)]
     pub auto_approve: bool,
+    /// Bandwidth throttle configuration.
+    #[serde(default)]
+    pub throttle: ThrottleConfig,
+    /// Enable mDNS LAN peer discovery.
+    #[serde(default)]
+    pub mdns: bool,
+}
+
+/// Bandwidth throttle settings.
+///
+/// Set to 0 to disable throttling (default).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThrottleConfig {
+    /// Maximum upload bytes per second (0 = unlimited).
+    #[serde(default)]
+    pub max_upload_bytes_per_sec: u64,
+    /// Maximum download bytes per second (0 = unlimited).
+    #[serde(default)]
+    pub max_download_bytes_per_sec: u64,
 }
 
 impl Config {

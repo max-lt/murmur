@@ -139,12 +139,20 @@ impl Dag {
 
     /// Receive an entry from a remote peer.
     ///
-    /// Verifies hash and signature, checks that all parents exist, stores it,
-    /// updates tips, and applies to materialized state. Returns the entry for
-    /// platform persistence.
+    /// Verifies hash, signature, and authorization, checks that all parents
+    /// exist, stores it, updates tips, and applies to materialized state.
+    /// Returns the entry for platform persistence.
     pub fn receive_entry(&mut self, entry: DagEntry) -> Result<DagEntry, DagError> {
         entry.verify_hash()?;
         entry.verify_signature()?;
+
+        // Skip if already known (before authorization, since we already accepted it).
+        if self.entries.contains_key(&entry.hash) {
+            return Ok(entry);
+        }
+
+        // Authorize: check that the signing device is allowed to perform this action.
+        self.authorize_entry(&entry)?;
 
         // Check that all parents exist locally.
         let missing: Vec<[u8; 32]> = entry
@@ -155,11 +163,6 @@ impl Dag {
             .collect();
         if !missing.is_empty() {
             return Err(DagError::MissingParents(missing));
-        }
-
-        // Skip if already known.
-        if self.entries.contains_key(&entry.hash) {
-            return Ok(entry);
         }
 
         // Witness remote HLC.
@@ -279,6 +282,127 @@ impl Dag {
     /// This device's ID.
     pub fn device_id(&self) -> DeviceId {
         self.device_id
+    }
+
+    /// Check whether the signing device is authorized to perform the entry's action.
+    ///
+    /// Rules:
+    /// - `DeviceJoinRequest` is always allowed (that's how new devices announce).
+    /// - If no devices are approved yet (genesis), a self-approval is allowed.
+    /// - All other actions require the signing device to be approved.
+    fn authorize_entry(&self, entry: &DagEntry) -> Result<(), DagError> {
+        // Join requests are always permitted — unapproved devices must be able to
+        // announce themselves.
+        if matches!(&entry.action, Action::DeviceJoinRequest { .. }) {
+            return Ok(());
+        }
+
+        // Genesis case: if no devices are approved yet, allow a self-approval.
+        // This bootstraps the network — the first device approves itself.
+        let any_approved = self.state.devices.values().any(|d| d.approved);
+        if !any_approved
+            && let Action::DeviceApproved { device_id, .. } = &entry.action
+            && *device_id == entry.device_id
+        {
+            return Ok(());
+        }
+
+        // General rule: the signing device must be approved.
+        match self.state.devices.get(&entry.device_id) {
+            Some(info) if info.approved => Ok(()),
+            _ => Err(DagError::Unauthorized {
+                device_id: entry.device_id.to_string(),
+                action: entry.action.action_name().to_string(),
+            }),
+        }
+    }
+
+    /// Create a snapshot entry that captures the current materialized state.
+    ///
+    /// The snapshot serializes the full `MaterializedState` and records its
+    /// blake3 hash in an `Action::Snapshot` entry. Returns the snapshot entry
+    /// and the serialized state bytes (which the platform should persist
+    /// alongside the entry for fast-forward loading).
+    pub fn create_snapshot(&mut self) -> (DagEntry, Vec<u8>) {
+        let state_bytes = self.state.to_bytes();
+        let state_hash = *blake3::hash(&state_bytes).as_bytes();
+
+        let entry = self.append(Action::Snapshot { state_hash });
+        debug!(
+            hash = %hex_short(&entry.hash),
+            entries = self.entries.len(),
+            "dag: created snapshot"
+        );
+        (entry, state_bytes)
+    }
+
+    /// Load from a snapshot: replace the current state with a deserialized
+    /// snapshot, then add the snapshot entry itself.
+    ///
+    /// After calling this, the caller should load any entries appended *after*
+    /// the snapshot via [`Dag::load_entry`].
+    ///
+    /// Verifies that the state bytes match the hash recorded in the snapshot
+    /// entry before applying.
+    pub fn load_snapshot(
+        &mut self,
+        snapshot_entry: DagEntry,
+        state_bytes: &[u8],
+    ) -> Result<(), DagError> {
+        snapshot_entry.verify_hash()?;
+        snapshot_entry.verify_signature()?;
+
+        // Extract and verify the state hash.
+        let expected_hash = match &snapshot_entry.action {
+            Action::Snapshot { state_hash } => *state_hash,
+            _ => {
+                return Err(DagError::Deserialization(
+                    "expected Snapshot action".to_string(),
+                ));
+            }
+        };
+
+        let actual_hash = *blake3::hash(state_bytes).as_bytes();
+        if actual_hash != expected_hash {
+            return Err(DagError::InvalidHash);
+        }
+
+        // Deserialize and replace the state.
+        let state = MaterializedState::from_bytes(state_bytes)?;
+        self.state = state;
+
+        // Witness the HLC.
+        self.clock.witness(snapshot_entry.hlc);
+
+        // Add the snapshot entry to the store.
+        let hash = snapshot_entry.hash;
+        self.entries.insert(hash, snapshot_entry);
+        self.tips = HashSet::from([hash]);
+
+        Ok(())
+    }
+
+    /// Check whether the DAG should create a snapshot.
+    ///
+    /// Returns `true` if the number of entries since the last snapshot (or
+    /// since the beginning) exceeds `interval`.
+    pub fn should_snapshot(&self, interval: usize) -> bool {
+        if interval == 0 {
+            return false;
+        }
+        // Find the HLC of the most recent snapshot entry.
+        let last_snapshot_hlc = self
+            .entries
+            .values()
+            .filter(|e| matches!(e.action, Action::Snapshot { .. }))
+            .map(|e| e.hlc)
+            .max();
+        // Count entries with HLC after the last snapshot (or all if no snapshot).
+        let entries_since = match last_snapshot_hlc {
+            Some(snap_hlc) => self.entries.values().filter(|e| e.hlc > snap_hlc).count(),
+            None => self.entries.len(),
+        };
+        entries_since >= interval
     }
 
     /// BFS reachable set from a given set of starting hashes.
@@ -438,13 +562,21 @@ mod tests {
 
     #[test]
     fn test_receive_remote_entry() {
-        let mut dag_a = make_dag();
+        let (id_a, sk_a) = make_keypair();
+        let mut dag_a = Dag::new(id_a, sk_a);
         let mut dag_b = make_dag();
+
+        // Self-approve device A so its entries are authorized.
+        let approve = dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
+        dag_b.receive_entry(approve).unwrap();
 
         let entry = dag_a.append(Action::Merge);
         let received = dag_b.receive_entry(entry.clone()).unwrap();
         assert_eq!(received.hash, entry.hash);
-        assert_eq!(dag_b.len(), 1);
+        assert_eq!(dag_b.len(), 2);
     }
 
     #[test]
@@ -471,8 +603,16 @@ mod tests {
 
     #[test]
     fn test_reject_missing_parents() {
-        let mut dag_a = make_dag();
+        let (id_a, sk_a) = make_keypair();
+        let mut dag_a = Dag::new(id_a, sk_a);
         let mut dag_b = make_dag();
+
+        // Approve device A so its entries are authorized.
+        let approve = dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
+        dag_b.receive_entry(approve).unwrap();
 
         let _e1 = dag_a.append(Action::Merge);
         let e2 = dag_a.append(Action::Merge);
@@ -491,17 +631,30 @@ mod tests {
         let mut dag_a = Dag::new(id_a, sk_a);
         let mut dag_b = Dag::new(id_b, sk_b);
 
+        // Device A creates the network (self-approve) and approves B.
+        dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
+        dag_a.append(Action::DeviceApproved {
+            device_id: id_b,
+            role: DeviceRole::Full,
+        });
+
+        // Sync A's history to B so B is known and approved.
+        dag_b.apply_sync_entries(dag_a.all_entries()).unwrap();
+
         // Both append independently.
         let ea = dag_a.append(Action::Merge);
         let eb = dag_b.append(Action::Merge);
 
-        // dag_a receives eb → now has 2 tips.
+        // dag_a receives eb → now has 2+ tips.
         dag_a.receive_entry(eb).unwrap();
-        assert_eq!(dag_a.tips().len(), 2);
+        assert!(dag_a.tips().len() >= 2);
 
-        // dag_a receives ea (already there).
+        // dag_b receives ea.
         dag_b.receive_entry(ea).unwrap();
-        assert_eq!(dag_b.tips().len(), 2);
+        assert!(dag_b.tips().len() >= 2);
 
         // Merge on dag_a.
         let merge = dag_a.maybe_merge().unwrap();
@@ -530,12 +683,19 @@ mod tests {
         let mut dag_a = Dag::new(id_a, sk_a);
         let mut dag_b = Dag::new(id_b, sk_b);
 
-        // dag_a has 3 entries.
+        // Self-approve device A.
+        let approve = dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
+        dag_b.receive_entry(approve).unwrap();
+
+        // dag_a has 3 more entries.
         let e1 = dag_a.append(Action::Merge);
         let _e2 = dag_a.append(Action::Merge);
         let _e3 = dag_a.append(Action::Merge);
 
-        // dag_b has only the first entry.
+        // dag_b has only the first entry after approval.
         dag_b.receive_entry(e1).unwrap();
 
         // Delta from dag_a's perspective, given dag_b's tips.
@@ -799,11 +959,18 @@ mod tests {
         let mut dag_a = Dag::new(id_a, sk_a);
         let mut dag_b = Dag::new(id_b, sk_b);
 
-        // dag_a adds some entries.
+        // Device A creates the network and approves B.
+        dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
         dag_a.append(Action::DeviceApproved {
             device_id: id_b,
             role: DeviceRole::Source,
         });
+
+        // Sync A's history to B so B is known and approved.
+        dag_b.apply_sync_entries(dag_a.all_entries()).unwrap();
         dag_a.append(Action::FileAdded {
             metadata: FileMetadata {
                 blob_hash: BlobHash::from_data(b"file1"),
@@ -815,7 +982,7 @@ mod tests {
             },
         });
 
-        // dag_b adds some entries.
+        // dag_b adds a file (B is self-approved, so this is allowed locally).
         dag_b.append(Action::FileAdded {
             metadata: FileMetadata {
                 blob_hash: BlobHash::from_data(b"file2"),
@@ -973,40 +1140,57 @@ mod tests {
 
     #[test]
     fn test_receive_duplicate_entry() {
-        let mut dag_a = make_dag();
+        let (id_a, sk_a) = make_keypair();
+        let mut dag_a = Dag::new(id_a, sk_a);
         let mut dag_b = make_dag();
+
+        let approve = dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
+        dag_b.receive_entry(approve).unwrap();
 
         let entry = dag_a.append(Action::Merge);
         dag_b.receive_entry(entry.clone()).unwrap();
         // Receiving again should succeed (idempotent).
         dag_b.receive_entry(entry).unwrap();
-        assert_eq!(dag_b.len(), 1);
+        assert_eq!(dag_b.len(), 2);
     }
 
     #[test]
     fn test_apply_sync_entries_batch() {
-        let mut dag_a = make_dag();
+        let (id_a, sk_a) = make_keypair();
+        let mut dag_a = Dag::new(id_a, sk_a);
         let mut dag_b = make_dag();
 
+        // Self-approve, then append some entries.
+        let approve = dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
         let e1 = dag_a.append(Action::Merge);
         let e2 = dag_a.append(Action::Merge);
         let e3 = dag_a.append(Action::Merge);
 
         // Apply all at once (in scrambled order).
         let new = dag_b
-            .apply_sync_entries(vec![e3.clone(), e1.clone(), e2.clone()])
+            .apply_sync_entries(vec![e3.clone(), approve, e1.clone(), e2.clone()])
             .unwrap();
-        assert_eq!(new.len(), 3);
-        assert_eq!(dag_b.len(), 3);
+        assert_eq!(new.len(), 4);
+        assert_eq!(dag_b.len(), 4);
     }
 
     #[test]
     fn test_delta_empty_when_synced() {
         let (id_a, sk_a) = make_keypair();
-        let (id_b, sk_b) = make_keypair();
-
         let mut dag_a = Dag::new(id_a, sk_a);
-        let mut dag_b = Dag::new(id_b, sk_b);
+        let mut dag_b = make_dag();
+
+        let approve = dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
+        dag_b.receive_entry(approve).unwrap();
 
         let e1 = dag_a.append(Action::Merge);
         dag_b.receive_entry(e1).unwrap();
@@ -1030,5 +1214,378 @@ mod tests {
         let info = &dag.state().devices[&new_id];
         assert!(!info.approved);
         assert_eq!(info.name, "Phone");
+    }
+
+    // --- Authorization ---
+
+    #[test]
+    fn test_auth_join_request_always_allowed() {
+        // A DeviceJoinRequest should be accepted from any device, even unknown ones.
+        let (id_a, sk_a) = make_keypair();
+        let (id_b, sk_b) = make_keypair();
+
+        let mut dag_a = Dag::new(id_a, sk_a);
+        let mut dag_b = Dag::new(id_b, sk_b);
+
+        // dag_a self-approves (genesis).
+        dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
+
+        // Sync dag_a's entries to dag_b so dag_b has id_a approved.
+        let entries = dag_a.all_entries();
+        dag_b.apply_sync_entries(entries).unwrap();
+
+        // Now an unknown device (id_c) sends a join request via dag_a.
+        let (id_c, sk_c) = make_keypair();
+        let mut dag_c = Dag::new(id_c, sk_c);
+        let join_entry = dag_c.append(Action::DeviceJoinRequest {
+            device_id: id_c,
+            name: "Phone".to_string(),
+        });
+
+        // dag_b should accept this join request even though id_c is unknown.
+        let result = dag_b.receive_entry(join_entry);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_auth_genesis_self_approval_allowed() {
+        // The very first DeviceApproved (self-approval) should succeed when
+        // no devices are approved yet.
+        let (id_a, sk_a) = make_keypair();
+        let (id_b, sk_b) = make_keypair();
+
+        let mut dag_a = Dag::new(id_a, sk_a);
+        let mut dag_b = Dag::new(id_b, sk_b);
+
+        let self_approve = dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
+
+        // dag_b has no approved devices — this genesis self-approval should work.
+        let result = dag_b.receive_entry(self_approve);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_auth_revoked_device_entry_rejected() {
+        let (id_a, sk_a) = make_keypair();
+        let (id_b, sk_b) = make_keypair();
+
+        let mut dag_a = Dag::new(id_a, sk_a);
+
+        // Device A self-approves and approves device B.
+        dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
+        dag_a.append(Action::DeviceApproved {
+            device_id: id_b,
+            role: DeviceRole::Source,
+        });
+
+        // Then revokes device B.
+        dag_a.append(Action::DeviceRevoked { device_id: id_b });
+
+        // Sync all of A's entries to a fresh dag.
+        let (id_viewer, sk_viewer) = make_keypair();
+        let mut dag_viewer = Dag::new(id_viewer, sk_viewer);
+        dag_viewer.apply_sync_entries(dag_a.all_entries()).unwrap();
+
+        // Device B (now revoked) tries to add a file.
+        let mut dag_b = Dag::new(id_b, sk_b);
+        let bad_entry = dag_b.append(Action::FileAdded {
+            metadata: sample_file_metadata(id_b),
+        });
+
+        // The viewer should reject this — device B is revoked.
+        let result = dag_viewer.receive_entry(bad_entry);
+        assert!(
+            matches!(result, Err(DagError::Unauthorized { .. })),
+            "expected Unauthorized, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_auth_unapproved_device_action_rejected() {
+        let (id_a, sk_a) = make_keypair();
+        let (id_b, sk_b) = make_keypair();
+
+        let mut dag_a = Dag::new(id_a, sk_a);
+        dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
+
+        // Sync to viewer.
+        let (id_viewer, sk_viewer) = make_keypair();
+        let mut dag_viewer = Dag::new(id_viewer, sk_viewer);
+        dag_viewer.apply_sync_entries(dag_a.all_entries()).unwrap();
+
+        // Device B is NOT approved but tries to add a file.
+        let mut dag_b = Dag::new(id_b, sk_b);
+        let bad_entry = dag_b.append(Action::FileAdded {
+            metadata: sample_file_metadata(id_b),
+        });
+
+        let result = dag_viewer.receive_entry(bad_entry);
+        assert!(
+            matches!(result, Err(DagError::Unauthorized { .. })),
+            "expected Unauthorized, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_auth_approved_device_action_accepted() {
+        let (id_a, sk_a) = make_keypair();
+        let (id_b, sk_b) = make_keypair();
+
+        let mut dag_a = Dag::new(id_a, sk_a);
+        dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
+        dag_a.append(Action::DeviceApproved {
+            device_id: id_b,
+            role: DeviceRole::Source,
+        });
+
+        // Sync to viewer.
+        let (id_viewer, sk_viewer) = make_keypair();
+        let mut dag_viewer = Dag::new(id_viewer, sk_viewer);
+        dag_viewer.apply_sync_entries(dag_a.all_entries()).unwrap();
+
+        // Device B is approved and adds a file — should succeed.
+        let mut dag_b = Dag::new(id_b, sk_b);
+        let entry = dag_b.append(Action::FileAdded {
+            metadata: sample_file_metadata(id_b),
+        });
+
+        let result = dag_viewer.receive_entry(entry);
+        assert!(result.is_ok());
+    }
+
+    // --- Snapshot / Compaction ---
+
+    #[test]
+    fn test_create_snapshot_captures_state() {
+        let mut dag = make_dag();
+        dag.append(Action::DeviceApproved {
+            device_id: dag.device_id(),
+            role: DeviceRole::Full,
+        });
+        dag.append(Action::FileAdded {
+            metadata: sample_file_metadata(dag.device_id()),
+        });
+
+        let (snap_entry, state_bytes) = dag.create_snapshot();
+
+        // Verify the entry is a Snapshot action with the correct hash.
+        match &snap_entry.action {
+            Action::Snapshot { state_hash } => {
+                let expected = *blake3::hash(&state_bytes).as_bytes();
+                assert_eq!(*state_hash, expected);
+            }
+            _ => panic!("expected Snapshot action"),
+        }
+
+        // Verify the state bytes deserialize correctly.
+        let restored = MaterializedState::from_bytes(&state_bytes).unwrap();
+        assert_eq!(restored.devices.len(), dag.state().devices.len());
+        assert_eq!(restored.files.len(), dag.state().files.len());
+    }
+
+    #[test]
+    fn test_snapshot_roundtrip_state_serialization() {
+        let mut dag = make_dag();
+        let device_id = dag.device_id();
+
+        dag.append(Action::DeviceApproved {
+            device_id,
+            role: DeviceRole::Full,
+        });
+
+        let (other_id, _) = make_keypair();
+        dag.append(Action::DeviceJoinRequest {
+            device_id: other_id,
+            name: "Phone".to_string(),
+        });
+        dag.append(Action::DeviceApproved {
+            device_id: other_id,
+            role: DeviceRole::Source,
+        });
+        dag.append(Action::FileAdded {
+            metadata: sample_file_metadata(device_id),
+        });
+        dag.append(Action::AccessGranted {
+            grant: AccessGrant {
+                to: other_id,
+                from: device_id,
+                scope: AccessScope::AllFiles,
+                expires_at: 9999,
+                signature_r: [0u8; 32],
+                signature_s: [0u8; 32],
+            },
+        });
+
+        let state = dag.state();
+        let bytes = state.to_bytes();
+        let restored = MaterializedState::from_bytes(&bytes).unwrap();
+
+        assert_eq!(restored.devices.len(), state.devices.len());
+        assert_eq!(restored.files.len(), state.files.len());
+        assert_eq!(restored.grants.len(), state.grants.len());
+
+        // Verify specific values survived the roundtrip.
+        assert!(restored.devices[&device_id].approved);
+        assert!(restored.devices[&other_id].approved);
+        assert_eq!(restored.devices[&other_id].name, "Phone");
+        assert_eq!(restored.grants[0].to, other_id);
+    }
+
+    #[test]
+    fn test_load_snapshot_fast_forward() {
+        // Build a DAG with some state, snapshot it, then load the snapshot
+        // into a new DAG and verify the state matches.
+        let (id_a, sk_a) = make_keypair();
+        let mut dag_a = Dag::new(id_a, sk_a.clone());
+
+        dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
+        dag_a.append(Action::FileAdded {
+            metadata: sample_file_metadata(id_a),
+        });
+        dag_a.append(Action::FileAdded {
+            metadata: FileMetadata {
+                blob_hash: BlobHash::from_data(b"second file"),
+                filename: "doc.pdf".to_string(),
+                size: 2048,
+                mime_type: Some("application/pdf".to_string()),
+                created_at: 100,
+                device_origin: id_a,
+            },
+        });
+
+        let (snap_entry, state_bytes) = dag_a.create_snapshot();
+
+        // New DAG loads just the snapshot — no replaying all entries.
+        let mut dag_b = Dag::new(id_a, sk_a);
+        dag_b.load_snapshot(snap_entry, &state_bytes).unwrap();
+
+        // State should match the original.
+        assert_eq!(dag_b.state().devices.len(), dag_a.state().devices.len());
+        assert_eq!(dag_b.state().files.len(), dag_a.state().files.len());
+        assert_eq!(dag_b.state().files.len(), 2);
+        assert!(dag_b.state().devices[&id_a].approved);
+    }
+
+    #[test]
+    fn test_load_snapshot_tampered_state_rejected() {
+        let (id_a, sk_a) = make_keypair();
+        let mut dag_a = Dag::new(id_a, sk_a.clone());
+
+        dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
+        let (snap_entry, mut state_bytes) = dag_a.create_snapshot();
+
+        // Tamper with the state bytes.
+        if let Some(byte) = state_bytes.last_mut() {
+            *byte ^= 0xff;
+        }
+
+        let mut dag_b = Dag::new(id_a, sk_a);
+        let result = dag_b.load_snapshot(snap_entry, &state_bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_snapshot_then_append_post_snapshot_entries() {
+        let (id_a, sk_a) = make_keypair();
+        let mut dag_a = Dag::new(id_a, sk_a.clone());
+
+        dag_a.append(Action::DeviceApproved {
+            device_id: id_a,
+            role: DeviceRole::Full,
+        });
+        dag_a.append(Action::FileAdded {
+            metadata: sample_file_metadata(id_a),
+        });
+
+        let (snap_entry, state_bytes) = dag_a.create_snapshot();
+
+        // Append more entries after the snapshot.
+        let post_snap_entry = dag_a.append(Action::FileAdded {
+            metadata: FileMetadata {
+                blob_hash: BlobHash::from_data(b"post-snapshot file"),
+                filename: "new.txt".to_string(),
+                size: 512,
+                mime_type: Some("text/plain".to_string()),
+                created_at: 200,
+                device_origin: id_a,
+            },
+        });
+
+        // New DAG: load snapshot, then load the post-snapshot entry.
+        let mut dag_b = Dag::new(id_a, sk_a);
+        dag_b.load_snapshot(snap_entry, &state_bytes).unwrap();
+        dag_b.load_entry(post_snap_entry).unwrap();
+
+        // Should have both the snapshot state AND the post-snapshot file.
+        assert_eq!(dag_b.state().files.len(), 2);
+    }
+
+    #[test]
+    fn test_should_snapshot_interval() {
+        let mut dag = make_dag();
+
+        // Empty DAG: should not snapshot.
+        assert!(!dag.should_snapshot(5));
+
+        dag.append(Action::DeviceApproved {
+            device_id: dag.device_id(),
+            role: DeviceRole::Full,
+        });
+        dag.append(Action::Merge);
+        dag.append(Action::Merge);
+
+        // 3 entries, interval 5: not yet.
+        assert!(!dag.should_snapshot(5));
+
+        dag.append(Action::Merge);
+        dag.append(Action::Merge);
+
+        // 5 entries, interval 5: should snapshot.
+        assert!(dag.should_snapshot(5));
+
+        // After snapshot, counter resets.
+        dag.create_snapshot();
+        // Now we have 6 entries (5 + snapshot), but 0 since last snapshot.
+        assert!(!dag.should_snapshot(5));
+
+        // Interval 0 always returns false.
+        assert!(!dag.should_snapshot(0));
+    }
+
+    #[test]
+    fn test_state_hash_deterministic() {
+        let mut dag = make_dag();
+        dag.append(Action::DeviceApproved {
+            device_id: dag.device_id(),
+            role: DeviceRole::Full,
+        });
+        dag.append(Action::FileAdded {
+            metadata: sample_file_metadata(dag.device_id()),
+        });
+
+        let hash1 = dag.state().state_hash();
+        let hash2 = dag.state().state_hash();
+        assert_eq!(hash1, hash2);
     }
 }

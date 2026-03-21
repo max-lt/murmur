@@ -83,9 +83,11 @@ fn test_two_device_full_sync() {
 #[test]
 fn test_two_device_concurrent_files() {
     let (mut engine_a, _) = create_engine("NAS", DeviceRole::Full);
-    let (mut engine_b, _) = create_engine("Phone", DeviceRole::Full);
+    let (mut engine_b, _, id_b) = join_engine("Phone");
     let id_a = engine_a.device_id();
-    let id_b = engine_b.device_id();
+
+    // A approves B and they sync.
+    join_approve_sync(&mut engine_a, &mut engine_b, id_b, DeviceRole::Full);
 
     // Both add files independently (no sync yet).
     let (meta_a, data_a) = make_file(b"file from A", "a.txt", id_a);
@@ -118,9 +120,11 @@ fn test_two_device_concurrent_files() {
 #[test]
 fn test_two_device_deduplication() {
     let (mut engine_a, _) = create_engine("NAS", DeviceRole::Full);
-    let (mut engine_b, _) = create_engine("Phone", DeviceRole::Full);
+    let (mut engine_b, _, id_b) = join_engine("Phone");
     let id_a = engine_a.device_id();
-    let id_b = engine_b.device_id();
+
+    // A approves B and they sync.
+    join_approve_sync(&mut engine_a, &mut engine_b, id_b, DeviceRole::Full);
 
     let content = b"identical content on both devices";
 
@@ -147,11 +151,11 @@ fn test_two_device_deduplication() {
 #[test]
 fn test_two_device_delta_sync() {
     let (mut engine_a, _) = create_engine("NAS", DeviceRole::Full);
-    let (mut engine_b, _) = create_engine("Phone", DeviceRole::Full);
+    let (mut engine_b, _, id_b) = join_engine("Phone");
     let id_a = engine_a.device_id();
 
-    // Sync founding entries.
-    bidirectional_sync(&mut engine_a, &mut engine_b);
+    // A approves B and they sync.
+    join_approve_sync(&mut engine_a, &mut engine_b, id_b, DeviceRole::Full);
 
     // A adds 3 files.
     for i in 0..3 {
