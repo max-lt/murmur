@@ -103,19 +103,19 @@ platforms/
 
 All shared types, identifiers, and the hybrid logical clock.
 
-| Type | Description |
-|------|-------------|
-| `DeviceId([u8; 32])` | Ed25519 public key. Hex display. Doubles as iroh `NodeId`. |
-| `BlobHash([u8; 32])` | blake3 hash of file content. Used for content-addressing and dedup. |
-| `NetworkId([u8; 32])` | blake3(hkdf(seed, "murmur/network-id")). Identifies the private network. |
-| `DeviceRole` | `Source` (produces files), `Backup` (stores files), `Full` (both). |
-| `DeviceInfo` | Device metadata: ID, name, role, approval status, join timestamp. |
-| `FileMetadata` | File metadata: blob hash, filename, size, MIME type, origin device. |
-| `AccessGrant` | Scoped, time-limited access from one device to another. Signed by grantor. |
-| `AccessScope` | `AllFiles`, `FilesByPrefix(String)`, `SingleFile(BlobHash)`. |
-| `Action` | 10-variant enum covering device management, file sync, access control, DAG maintenance. |
-| `HybridClock` | Monotonic timestamp combining wall clock and logical counter. Thread-safe (AtomicU64). |
-| `GossipPayload` | Envelope for gossip messages (DAG entries, membership events). |
+| Type                  | Description                                                                             |
+| --------------------- | --------------------------------------------------------------------------------------- |
+| `DeviceId([u8; 32])`  | Ed25519 public key. Hex display. Doubles as iroh `NodeId`.                              |
+| `BlobHash([u8; 32])`  | blake3 hash of file content. Used for content-addressing and dedup.                     |
+| `NetworkId([u8; 32])` | blake3(hkdf(seed, "murmur/network-id")). Identifies the private network.                |
+| `DeviceRole`          | `Source` (produces files), `Backup` (stores files), `Full` (both).                      |
+| `DeviceInfo`          | Device metadata: ID, name, role, approval status, join timestamp.                       |
+| `FileMetadata`        | File metadata: blob hash, filename, size, MIME type, origin device.                     |
+| `AccessGrant`         | Scoped, time-limited access from one device to another. Signed by grantor.              |
+| `AccessScope`         | `AllFiles`, `FilesByPrefix(String)`, `SingleFile(BlobHash)`.                            |
+| `Action`              | 10-variant enum covering device management, file sync, access control, DAG maintenance. |
+| `HybridClock`         | Monotonic timestamp combining wall clock and logical counter. Thread-safe (AtomicU64).  |
+| `GossipPayload`       | Envelope for gossip messages (DAG entries, membership events).                          |
 
 ### murmur-seed
 
@@ -134,12 +134,14 @@ BIP39 mnemonic generation and HKDF key derivation.
 Signed append-only DAG, adapted from Shoal's LogTree. **In-memory only** — the platform persists entries.
 
 **DagEntry** — the fundamental unit:
+
 - Fields: `hash` (blake3), `hlc`, `device_id`, `action`, `parents` (DAG edges), `signature_r/s` (Ed25519)
 - `new_signed()` — create, compute blake3 hash, sign with Ed25519
 - `verify_hash()` / `verify_signature()` — cryptographic verification
 - `to_bytes()` / `from_bytes()` — postcard serialization for persistence
 
 **Dag** — the in-memory store:
+
 - `load_entry()` — platform feeds a persisted entry on startup
 - `append(action)` — create entry with current tips as parents, update tips, apply to materialized state
 - `receive_entry()` — verify and apply an entry received from a peer
@@ -148,6 +150,7 @@ Signed append-only DAG, adapted from Shoal's LogTree. **In-memory only** — the
 - `maybe_merge()` — auto-merge when multiple tips exist
 
 **MaterializedState** — derived cache rebuilt by replaying DAG entries in topological order:
+
 - `devices: BTreeMap<DeviceId, DeviceInfo>` — peer list
 - `files: BTreeMap<BlobHash, FileMetadata>` — file index
 - `grants: Vec<AccessGrant>` — active access grants
@@ -157,23 +160,27 @@ Signed append-only DAG, adapted from Shoal's LogTree. **In-memory only** — the
 iroh QUIC transport, gossip broadcast, and shared wire utilities.
 
 **MurmurMessage** — 12 variants covering:
+
 - DAG sync: `DagEntryBroadcast`, `DagSyncRequest/Response`
 - Blob transfer: `BlobPush/PushAck`, `BlobRequest/Response`
 - Access control: `AccessRequest/Response`
 - Keepalive: `Ping/Pong`
 
 **MurmurTransport** — iroh `Endpoint` wrapper:
+
 - Length-prefixed postcard-over-QUIC messaging
 - Connection pooling
 - `push_blob()` / `pull_blob()` — blob transfer with blake3 verification
 - `pull_dag_entries()` — DAG synchronization
 
 **GossipHandle** — iroh-gossip wrapper:
+
 - TopicId derived from NetworkId
 - `subscribe_and_join()` / `broadcast_payload()`
 - ALPN isolation: each network has a unique ALPN preventing cross-network connections
 
 **Wire utilities** (`wire` module) — shared by `murmurd` and `murmur-ffi`:
+
 - `compress_wire()` / `decompress_wire()` — deflate compression with 1-byte flag prefix (0=raw, 1=compressed). Only compresses payloads ≥256 bytes and only if compression saves space.
 - `ChunkBuffer` — reassembly buffer for chunked blob transfers (blobs >4 MB split into 1 MB chunks)
 - Constants: `CHUNK_THRESHOLD` (4 MB), `CHUNK_SIZE` (1 MB), `COMPRESS_THRESHOLD` (256 bytes)
@@ -183,6 +190,7 @@ iroh QUIC transport, gossip broadcast, and shared wire utilities.
 The orchestrator tying DAG, network, and platform together. Storage-agnostic.
 
 **MurmurEngine**:
+
 - `create_network()` / `join_network()` — network lifecycle
 - `approve_device()` / `revoke_device()` / `list_devices()` / `pending_requests()` — device management
 - `add_file()` — file sync with dedup
@@ -190,6 +198,7 @@ The orchestrator tying DAG, network, and platform together. Storage-agnostic.
 - `compute_delta()` / `receive_sync_entries()` — DAG synchronization
 
 **PlatformCallbacks** trait (implemented by each platform):
+
 - `on_dag_entry(entry_bytes)` — persist a new DAG entry
 - `on_blob_received(blob_hash, data)` — store a received blob
 - `on_blob_needed(blob_hash) → Option<Vec<u8>>` — retrieve a stored blob
@@ -241,7 +250,7 @@ Headless daemon for NAS, Raspberry Pi, or VPS. Pure daemon — no subcommands, m
 
 ### murmur-desktop
 
-iced 0.14 GUI desktop app for Pop!_OS (COSMIC) and other Linux desktops.
+iced 0.14 GUI desktop app for linux desktops.
 
 - **Setup screen**: device name, create/join network, mnemonic generation/entry
 - **Devices tab**: approved devices with revoke, pending requests with approve
@@ -256,36 +265,38 @@ iced 0.14 GUI desktop app for Pop!_OS (COSMIC) and other Linux desktops.
 ### Platform Contract
 
 Every platform must provide:
+
 1. **Load** — feed persisted DAG entries into the engine on startup
 2. **Callbacks** — persist new DAG entries and blobs when the engine produces them
 3. **User decisions** — approve/reject device join requests, access requests
 
 The engine provides:
+
 1. **Serialized data** — DagEntry bytes, blob bytes to persist
 2. **Events** — device joined, file synced, access requested, etc.
 3. **Functions** — add file, approve device, request access, etc.
 
 ### Desktop (murmurd + murmur-desktop)
 
-| Concern | Implementation |
-|---------|---------------|
-| DAG persistence | Fjall v3 (embedded key-value store) |
-| Blob storage | Content-addressed filesystem (`~/.murmur/blobs/ab/cd/...`) |
-| Config | TOML file (`~/.murmur/config.toml`) |
-| UI | CLI (murmurd) or iced GUI (murmur-desktop) |
+| Concern         | Implementation                                             |
+| --------------- | ---------------------------------------------------------- |
+| DAG persistence | Fjall v3 (embedded key-value store)                        |
+| Blob storage    | Content-addressed filesystem (`~/.murmur/blobs/ab/cd/...`) |
+| Config          | TOML file (`~/.murmur/config.toml`)                        |
+| UI              | CLI (murmurd) or iced GUI (murmur-desktop)                 |
 
 ### Android
 
-| Concern | Implementation |
-|---------|---------------|
-| DAG persistence | Room database (`DagEntryEntity` with hash + raw bytes) |
-| Blob storage | App-private filesystem (`filesDir/blobs/<aa>/<rest>`) |
-| Background sync | Foreground Service (`MurmurService`, sticky) |
-| Auto-upload | `ContentObserver` on `MediaStore.Images` |
-| File exposure | `DocumentsProvider` (Android Files app integration) |
-| UI | Jetpack Compose with ViewModels + StateFlow |
-| Boot persistence | `BootReceiver` (BOOT_COMPLETED, MY_PACKAGE_REPLACED) |
-| Rust integration | cargo-ndk → jniLibs (arm64-v8a, armeabi-v7a, x86_64) |
+| Concern          | Implementation                                         |
+| ---------------- | ------------------------------------------------------ |
+| DAG persistence  | Room database (`DagEntryEntity` with hash + raw bytes) |
+| Blob storage     | App-private filesystem (`filesDir/blobs/<aa>/<rest>`)  |
+| Background sync  | Foreground Service (`MurmurService`, sticky)           |
+| Auto-upload      | `ContentObserver` on `MediaStore.Images`               |
+| File exposure    | `DocumentsProvider` (Android Files app integration)    |
+| UI               | Jetpack Compose with ViewModels + StateFlow            |
+| Boot persistence | `BootReceiver` (BOOT_COMPLETED, MY_PACKAGE_REPLACED)   |
+| Rust integration | cargo-ndk → jniLibs (arm64-v8a, armeabi-v7a, x86_64)   |
 
 ---
 
@@ -374,47 +385,47 @@ Action::Snapshot { state_hash }
 
 ### Core (pure Rust, no C dependencies)
 
-| Purpose | Crate | Version |
-|---------|-------|---------|
-| Hashing | `blake3` | 1.x |
-| Networking | `iroh` | 0.96 |
-| Gossip | `iroh-gossip` | 0.96 |
-| BIP39 | `bip39` | 2.x |
-| Key derivation | `hkdf` + `sha2` | — |
-| Signing | `ed25519-dalek` | 2.x |
-| Serialization | `postcard` + `serde` | 1.x |
-| Async | `tokio` | 1.x |
-| Logging | `tracing` | 0.1 |
-| FFI | `uniffi` | 0.31 |
+| Purpose        | Crate                | Version |
+| -------------- | -------------------- | ------- |
+| Hashing        | `blake3`             | 1.x     |
+| Networking     | `iroh`               | 0.96    |
+| Gossip         | `iroh-gossip`        | 0.96    |
+| BIP39          | `bip39`              | 2.x     |
+| Key derivation | `hkdf` + `sha2`      | —       |
+| Signing        | `ed25519-dalek`      | 2.x     |
+| Serialization  | `postcard` + `serde` | 1.x     |
+| Async          | `tokio`              | 1.x     |
+| Logging        | `tracing`            | 0.1     |
+| FFI            | `uniffi`             | 0.31    |
 
 ### Desktop only
 
-| Purpose | Crate |
-|---------|-------|
-| Metadata DB | `fjall` v3 |
-| CLI | `clap` v4 |
-| Desktop UI | `iced` 0.14 |
+| Purpose     | Crate       |
+| ----------- | ----------- |
+| Metadata DB | `fjall` v3  |
+| CLI         | `clap` v4   |
+| Desktop UI  | `iced` 0.14 |
 
 ### Android
 
-| Purpose | Library |
-|---------|---------|
-| UI | Jetpack Compose (Material Design 3) |
-| Database | Room |
-| Architecture | ViewModel + StateFlow |
-| Rust bridge | cargo-ndk + UniFFI-generated Kotlin |
+| Purpose      | Library                             |
+| ------------ | ----------------------------------- |
+| UI           | Jetpack Compose (Material Design 3) |
+| Database     | Room                                |
+| Architecture | ViewModel + StateFlow               |
+| Rust bridge  | cargo-ndk + UniFFI-generated Kotlin |
 
 ---
 
 ## Key Design Decisions
 
-| Decision | Rationale |
-|----------|-----------|
-| BIP39 over random secret | Users can write down 12/24 words on paper. Same UX as Bitcoin wallets. |
-| HKDF over BIP32 | No hierarchical derivation needed. HKDF with domain separation is simpler. |
-| iroh for networking | QUIC with built-in hole punching and relay fallback. `NodeId` is already Ed25519. |
-| No storage in core | Each platform has optimal storage (Fjall, Room, Core Data). Core deals with bytes only. |
-| FFI at engine, not iroh | Mobile code never touches iroh types. Stable, simple FFI surface. |
-| UniFFI proc-macro | No UDL file needed. Generates Kotlin + Swift from Rust annotations. |
-| In-memory DAG | Platform persists and feeds entries on startup. Core doesn't know how storage works. |
-| Postcard wire format | Compact binary serialization. Deterministic for hashing. |
+| Decision                 | Rationale                                                                               |
+| ------------------------ | --------------------------------------------------------------------------------------- |
+| BIP39 over random secret | Users can write down 12/24 words on paper. Same UX as Bitcoin wallets.                  |
+| HKDF over BIP32          | No hierarchical derivation needed. HKDF with domain separation is simpler.              |
+| iroh for networking      | QUIC with built-in hole punching and relay fallback. `NodeId` is already Ed25519.       |
+| No storage in core       | Each platform has optimal storage (Fjall, Room, Core Data). Core deals with bytes only. |
+| FFI at engine, not iroh  | Mobile code never touches iroh types. Stable, simple FFI surface.                       |
+| UniFFI proc-macro        | No UDL file needed. Generates Kotlin + Swift from Rust annotations.                     |
+| In-memory DAG            | Platform persists and feeds entries on startup. Core doesn't know how storage works.    |
+| Postcard wire format     | Compact binary serialization. Deterministic for hashing.                                |

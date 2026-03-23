@@ -19,14 +19,15 @@ All mutations (device joins, file additions, access grants) are recorded in a **
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  Platform (storage, UI, OS integration)                     │
-│  murmurd / murmur-desktop / Android (future) / iOS (future) │
+│  murmurd / murmur-cli / murmur-desktop                      │
+|      / Android / iOS (later)                                 │
 ├─────────────────────────────────────────────────────────────┤
 │  Rust Core (protocol + logic, no storage)                   │
 │  ┌─────────────────────────────────────┐                    │
 │  │  Engine    — sync, approval, blobs  │                    │
 │  │  DAG       — signed append-only log │                    │
 │  │  Network   — iroh QUIC + gossip     │                    │
-│  │  Seed      — BIP39 + HKDF keys     │                    │
+│  │  Seed      — BIP39 + HKDF keys      │                    │
 │  │  Types     — DeviceId, BlobHash, …  │                    │
 │  └─────────────────────────────────────┘                    │
 └─────────────────────────────────────────────────────────────┘
@@ -41,10 +42,15 @@ crates/
   murmur-types/      Shared types (DeviceId, BlobHash, NetworkId, HLC, roles)
   murmur-seed/       BIP39 mnemonic + HKDF key derivation
   murmur-dag/        Signed append-only DAG (in-memory, platform persists)
-  murmur-net/        iroh QUIC + gossip broadcast
-  murmur-engine/     Orchestrator (sync, approval, blob transfer)
-  murmurd/           Headless backup server daemon (NAS/RPi/VPS)
+  murmur-net/        Network (iroh QUIC + gossip + shared wire utilities)
+  murmur-engine/     Orchestrator (sync, approval, blob transfer, storage-agnostic)
+  murmur-ipc/        IPC protocol types for daemon ↔ CLI communication
+  murmur-cli/        CLI tool for managing murmurd (init, join, approve, status, etc.)
+  murmurd/           Headless backup daemon (NAS/RPi/VPS)
   murmur-desktop/    iced desktop GUI app (Linux, macOS, Windows)
+  murmur-ffi/        UniFFI bindings for mobile platforms (Android, iOS)
+platforms/
+  android/           Android app wrapping murmur-ffi
 tests/
   integration/       Multi-device simulation tests
 ```
@@ -65,25 +71,32 @@ cargo fmt --check                    # format check
 # Headless backup daemon (NAS, RPi, VPS)
 cargo install --path crates/murmurd
 
+# CLI tool for managing the daemon
+cargo install --path crates/murmur-cli
+
 # iced desktop GUI app (Linux, macOS, Windows)
 cargo install --path crates/murmur-desktop
 ```
 
 ## Dependencies
 
-| Purpose        | Crate              |
-|----------------|--------------------|
-| Hashing        | blake3             |
-| Networking     | iroh 0.96          |
-| Gossip         | iroh-gossip 0.96   |
-| BIP39          | bip39 v2           |
-| Key derivation | hkdf + sha2        |
-| Signing        | ed25519-dalek v2   |
-| Serialization  | postcard + serde   |
-| Async          | tokio              |
-| UI (desktop)   | iced 0.14          |
+| Purpose        | Crate            |
+| -------------- | ---------------- |
+| Hashing        | blake3           |
+| Networking     | iroh 0.96        |
+| Gossip         | iroh-gossip 0.96 |
+| BIP39          | bip39 v2         |
+| Key derivation | hkdf + sha2      |
+| Signing        | ed25519-dalek v2 |
+| Serialization  | postcard + serde |
+| Async          | tokio            |
+| Encryption     | aes-gcm          |
+| Metrics        | prometheus       |
+| HTTP           | axum             |
+| mDNS           | mdns-sd          |
+| UI (desktop)   | iced 0.14        |
 
-Desktop platforms (`murmurd`, `murmur-desktop`): fjall v3 (metadata DB), clap (CLI).
+Desktop/server (`murmurd`, `murmur-cli`, `murmur-desktop`): fjall v3 (metadata DB), clap (CLI).
 
 No dependency requires C/C++ compilation in the core crates.
 
