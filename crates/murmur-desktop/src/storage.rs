@@ -239,9 +239,7 @@ mod tests {
         use ed25519_dalek::SigningKey;
         use murmur_dag::Dag;
         use murmur_types::{Action, DeviceId, DeviceRole};
-        use rand::rngs::OsRng;
-
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::from_bytes(&rand::random());
         let device_id = DeviceId::from_verifying_key(&sk.verifying_key());
         let mut dag = Dag::new(device_id, sk);
 
@@ -267,9 +265,7 @@ mod tests {
         use ed25519_dalek::SigningKey;
         use murmur_dag::Dag;
         use murmur_types::{Action, DeviceId, DeviceRole};
-        use rand::rngs::OsRng;
-
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::from_bytes(&rand::random());
         let device_id = DeviceId::from_verifying_key(&sk.verifying_key());
         let mut dag = Dag::new(device_id, sk);
 
@@ -304,9 +300,7 @@ mod tests {
         use ed25519_dalek::SigningKey;
         use murmur_dag::Dag;
         use murmur_types::{Action, DeviceId, DeviceRole};
-        use rand::rngs::OsRng;
-
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::from_bytes(&rand::random());
         let device_id = DeviceId::from_verifying_key(&sk.verifying_key());
         let mut dag = Dag::new(device_id, sk);
 
@@ -368,7 +362,8 @@ mod tests {
         );
         let path = dir.path().join("config.toml");
         std::fs::write(&path, &config).unwrap();
-        let parsed: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&content).unwrap();
         assert_eq!(parsed["device"]["name"].as_str(), Some("Desktop"));
         assert_eq!(parsed["device"]["role"].as_str(), Some("full"));
     }

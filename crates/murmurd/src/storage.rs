@@ -420,9 +420,7 @@ mod tests {
         use ed25519_dalek::SigningKey;
         use murmur_dag::Dag;
         use murmur_types::{Action, DeviceId, DeviceRole};
-        use rand::rngs::OsRng;
-
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::from_bytes(&rand::random());
         let device_id = DeviceId::from_verifying_key(&sk.verifying_key());
         let mut dag = Dag::new(device_id, sk);
 
@@ -448,9 +446,7 @@ mod tests {
         use ed25519_dalek::SigningKey;
         use murmur_dag::Dag;
         use murmur_types::{Action, DeviceId, DeviceRole};
-        use rand::rngs::OsRng;
-
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::from_bytes(&rand::random());
         let device_id = DeviceId::from_verifying_key(&sk.verifying_key());
         let mut dag = Dag::new(device_id, sk);
 
@@ -625,9 +621,7 @@ mod tests {
         use ed25519_dalek::SigningKey;
         use murmur_dag::Dag;
         use murmur_types::{Action, DeviceId, DeviceRole};
-        use rand::rngs::OsRng;
-
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::from_bytes(&rand::random());
         let device_id = DeviceId::from_verifying_key(&sk.verifying_key());
         let mut dag = Dag::new(device_id, sk);
 

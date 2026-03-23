@@ -14,6 +14,7 @@ use murmur_dag::DagEntry;
 use murmur_engine::MurmurEngine;
 use murmur_net::{CHUNK_SIZE, CHUNK_THRESHOLD, ChunkBuffer, compress_wire, decompress_wire};
 use murmur_types::{Action, BlobHash, DeviceId, GossipMessage, GossipPayload};
+use rand::TryRng;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -74,12 +75,14 @@ pub(crate) async fn start_networking(
         creator_secret
     } else {
         let mut bytes = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut bytes)
+            .expect("OS RNG should not fail");
         iroh::SecretKey::from_bytes(&bytes)
     };
 
     // Create iroh endpoint with relay enabled (for NAT traversal).
-    let endpoint = iroh::Endpoint::builder()
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(my_secret)
         .alpns(vec![iroh_gossip::ALPN.to_vec()])
         .bind()

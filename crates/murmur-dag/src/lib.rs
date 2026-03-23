@@ -515,10 +515,8 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use murmur_types::*;
-    use rand::rngs::OsRng;
-
     fn make_keypair() -> (DeviceId, SigningKey) {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = SigningKey::from_bytes(&rand::random());
         let id = DeviceId::from_verifying_key(&sk.verifying_key());
         (id, sk)
     }

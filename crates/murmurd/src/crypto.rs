@@ -20,7 +20,7 @@ const NONCE_LEN: usize = 12;
 #[allow(dead_code)] // Used for seed/key encryption (not yet wired into CLI flow).
 pub fn encrypt_with_password(plaintext: &[u8], password: &[u8]) -> Result<Vec<u8>> {
     let mut salt = [0u8; SALT_LEN];
-    rand::RngCore::fill_bytes(&mut OsRng, &mut salt);
+    aes_gcm::aead::rand_core::RngCore::fill_bytes(&mut OsRng, &mut salt);
 
     let key = derive_key(password, &salt)?;
     let cipher = Aes256Gcm::new_from_slice(&key).expect("valid key length");

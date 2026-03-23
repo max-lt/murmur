@@ -18,6 +18,7 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use murmur_types::{DeviceId, NetworkId};
+use rand::TryRng;
 use sha2::Sha256;
 use zeroize::Zeroize;
 
@@ -63,7 +64,9 @@ impl WordCount {
 pub fn generate_mnemonic(word_count: WordCount) -> bip39::Mnemonic {
     let entropy_bytes = word_count.entropy_bits() / 8;
     let mut entropy = vec![0u8; entropy_bytes];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut entropy);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut entropy)
+        .expect("OS RNG should not fail");
     bip39::Mnemonic::from_entropy(&entropy).expect("valid entropy length")
 }
 
@@ -217,7 +220,12 @@ pub struct DeviceKeyPair {
 impl DeviceKeyPair {
     /// Generate a new random device keypair.
     pub fn generate() -> Self {
-        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut key_bytes = [0u8; 32];
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut key_bytes)
+            .expect("OS RNG should not fail");
+        let signing_key = SigningKey::from_bytes(&key_bytes);
+        key_bytes.zeroize();
         Self { signing_key }
     }
 

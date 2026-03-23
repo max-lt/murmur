@@ -482,7 +482,7 @@ impl App {
     /// Load engine from persisted config, mnemonic, and DAG entries.
     fn load_engine(&mut self) -> anyhow::Result<()> {
         let config_str = std::fs::read_to_string(self.data_dir.join("config.toml"))?;
-        let config: toml::Value = config_str.parse()?;
+        let config: toml::Value = toml::from_str(&config_str)?;
 
         let storage_config = config
             .get("storage")

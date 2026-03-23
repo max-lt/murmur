@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use ed25519_dalek::SigningKey;
 use murmur_engine::{EngineEvent, MurmurEngine, PlatformCallbacks};
 use murmur_types::{AccessGrant, AccessScope, BlobHash, DeviceId, DeviceRole, FileMetadata};
-use rand::rngs::OsRng;
 
 /// Test platform callbacks that capture all events, entries, and blobs.
 #[derive(Default)]
@@ -40,7 +39,7 @@ impl PlatformCallbacks for TestCallbacks {
 
 /// Create a new engine as the first device in a network.
 pub fn create_engine(name: &str, role: DeviceRole) -> (MurmurEngine, Arc<TestCallbacks>) {
-    let sk = SigningKey::generate(&mut OsRng);
+    let sk = SigningKey::from_bytes(&rand::random());
     let device_id = DeviceId::from_verifying_key(&sk.verifying_key());
     let cb = Arc::new(TestCallbacks::default());
     let engine = MurmurEngine::create_network(device_id, sk, name.to_string(), role, cb.clone());
@@ -49,7 +48,7 @@ pub fn create_engine(name: &str, role: DeviceRole) -> (MurmurEngine, Arc<TestCal
 
 /// Create a new engine that joins an existing network (pending approval).
 pub fn join_engine(name: &str) -> (MurmurEngine, Arc<TestCallbacks>, DeviceId) {
-    let sk = SigningKey::generate(&mut OsRng);
+    let sk = SigningKey::from_bytes(&rand::random());
     let device_id = DeviceId::from_verifying_key(&sk.verifying_key());
     let cb = Arc::new(TestCallbacks::default());
     let engine = MurmurEngine::join_network(device_id, sk, name.to_string(), cb.clone());

@@ -247,13 +247,13 @@ mod tests {
         let alpn = network_alpn(&nid);
         let disco = MemoryLookup::new();
 
-        let ep1 = iroh::Endpoint::empty_builder(iroh::RelayMode::Disabled)
+        let ep1 = iroh::Endpoint::empty_builder()
             .address_lookup(disco.clone())
             .alpns(vec![alpn.clone()])
             .bind()
             .await
             .unwrap();
-        let ep2 = iroh::Endpoint::empty_builder(iroh::RelayMode::Disabled)
+        let ep2 = iroh::Endpoint::empty_builder()
             .address_lookup(disco.clone())
             .alpns(vec![alpn.clone()])
             .bind()
@@ -399,13 +399,13 @@ mod tests {
         let topic = topic_from_network_id(&network_id);
         let disco = MemoryLookup::new();
 
-        let ep1 = iroh::Endpoint::empty_builder(iroh::RelayMode::Disabled)
+        let ep1 = iroh::Endpoint::empty_builder()
             .address_lookup(disco.clone())
             .alpns(vec![iroh_gossip::ALPN.to_vec()])
             .bind()
             .await
             .unwrap();
-        let ep2 = iroh::Endpoint::empty_builder(iroh::RelayMode::Disabled)
+        let ep2 = iroh::Endpoint::empty_builder()
             .address_lookup(disco.clone())
             .alpns(vec![iroh_gossip::ALPN.to_vec()])
             .bind()

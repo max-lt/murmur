@@ -414,13 +414,12 @@ pub struct GossipMessage {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
 
     // --- ID type tests ---
 
     #[test]
     fn test_device_id_from_verifying_key() {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::from_bytes(&rand::random());
         let verifying_key = signing_key.verifying_key();
         let id = DeviceId::from_verifying_key(&verifying_key);
         assert_eq!(id.as_bytes(), &verifying_key.to_bytes());
