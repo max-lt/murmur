@@ -426,11 +426,7 @@ networking (gossip, blob sync); the desktop app manages a second device via its
 GUI. Both run on the same machine with separate data directories.
 
 **Architecture note**: the desktop app embeds the engine directly (no IPC daemon).
-It has its own Fjall storage and blob directory. Networking (iroh gossip) is only
-in `murmurd`, so **the desktop app cannot sync over the network by itself**. This
-test verifies that both apps can join the same Murmur network, manage state
-independently, and that the desktop UI works correctly for device and file
-management.
+It has its own Fjall storage and blob directory.
 
 This test requires **3 terminal windows**: Terminal 1 runs the daemon, Terminal 2
 runs CLI commands, Terminal 3 runs the desktop app.
@@ -487,19 +483,75 @@ device as a single entry (pending approval — only visible to itself).
 
 ---
 
-### Phase 3 — Add File via Desktop
+### Phase 3 — Approve Desktop Device from CLI
 
-Navigate to the **Files tab** in the desktop app.
+**Terminal 2** — check the CLI daemon sees the pending device:
 
-1. Enter the path to a test file in the file path input (e.g. `/tmp/test-desktop.txt`)
-   — create it first:
+```bash
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a pending
+```
+
+**Expected**: one pending device — "desktop-node".
+
+Approve the desktop device. Use the device ID from the `pending` output:
+
+```bash
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a approve <DESKTOP_DEVICE_ID> --role full
+```
+
+**Expected**: "Device approved" confirmation.
+
+Wait a few seconds for gossip propagation, then verify from both sides:
+
+```bash
+# On CLI daemon
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a devices
+```
+
+**Expected**: two devices — "daemon-node" (full) and "desktop-node" (full).
+
+In the desktop app, navigate to the **Devices tab**.
+
+**Expected**: both devices listed — "daemon-node" and "desktop-node".
+
+**Checkpoint D3**: Desktop device approved, both sides see both devices.
+
+---
+
+### Phase 4 — File Sharing (CLI to Desktop)
+
+Add a file from the CLI daemon:
+
+```bash
+echo "Hello from CLI daemon — $(date)" > /tmp/test-daemon-file.txt
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a add /tmp/test-daemon-file.txt
+```
+
+**Expected**: "File added" with the blob hash.
+
+Wait 5-10 seconds for gossip + blob sync.
+
+In the desktop app, navigate to the **Files tab**.
+
+**Expected**: `test-daemon-file.txt` appears in the file list with filename, size,
+and MIME type `text/plain`.
+
+**Checkpoint D4**: File added on CLI daemon synced to desktop app.
+
+---
+
+### Phase 5 — File Sharing (Desktop to CLI)
+
+Create a test file and add it from the desktop app:
 
 ```bash
 echo "File added from desktop app" > /tmp/test-desktop.txt
 ```
 
-2. Type `/tmp/test-desktop.txt` in the file path input field
-3. Click **"Add File"**
+Navigate to the **Files tab** in the desktop app.
+
+1. Type `/tmp/test-desktop.txt` in the file path input field
+2. Click **"Add File"**
 
 **Expected**: the file appears in the files list with filename, size, and MIME type.
 
@@ -511,11 +563,19 @@ ls /tmp/murmur-desktop/blobs/
 
 **Expected**: blob directory structure with the file data.
 
-**Checkpoint D3**: Desktop app can add files and persist blobs to disk.
+Wait 5-10 seconds, then verify on CLI:
+
+```bash
+cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a files
+```
+
+**Expected**: two files — `test-daemon-file.txt` and `test-desktop.txt`.
+
+**Checkpoint D5**: Bidirectional file sync between desktop and CLI works.
 
 ---
 
-### Phase 4 — Verify Desktop State via Filesystem
+### Phase 6 — Verify Desktop State via Filesystem
 
 Check that the desktop app created proper state:
 
@@ -539,11 +599,11 @@ ls /tmp/murmur-desktop/db/
 - `device.key` is a 32-byte file
 - `db/` directory contains Fjall keyspaces
 
-**Checkpoint D4**: Desktop state persisted correctly to disk.
+**Checkpoint D6**: Desktop state persisted correctly to disk.
 
 ---
 
-### Phase 5 — Desktop Device Management
+### Phase 7 — Desktop Device Management
 
 Navigate to the **Devices tab** in the desktop app.
 
@@ -554,15 +614,15 @@ Navigate to the **Status tab**.
 **Expected**: shows:
 - Device ID (64-character hex)
 - DAG entry count (should be >= 1 for the join request)
-- File count (1 — the file from Phase 3)
+- File count (2 — files from Phases 4 and 5)
 - Data directory path (`/tmp/murmur-desktop`)
 - Event log with recent events (NetworkJoined, FileAdded, etc.)
 
-**Checkpoint D5**: Desktop UI displays correct status and event history.
+**Checkpoint D7**: Desktop UI displays correct status and event history.
 
 ---
 
-### Phase 6 — Desktop App Restart Persistence
+### Phase 8 — Desktop App Restart Persistence
 
 Close the desktop app (close the window or Ctrl+C in Terminal 3).
 
@@ -575,13 +635,13 @@ MURMUR_DATA_DIR=/tmp/murmur-desktop cargo run --bin murmur-desktop
 **Expected**: the app skips the Setup screen and loads directly into the Devices
 tab. All previously added files, devices, and events are intact.
 
-Navigate to the **Files tab** — the file from Phase 3 should still be listed.
+Navigate to the **Files tab** — files from Phases 4 and 5 should still be listed.
 
-**Checkpoint D6**: Desktop app state persists across restarts.
+**Checkpoint D8**: Desktop app state persists across restarts.
 
 ---
 
-### Phase 7 — Create Network via Desktop (Fresh)
+### Phase 9 — Create Network via Desktop (Fresh)
 
 Test that the desktop app can also create a new network (not just join).
 
@@ -610,14 +670,14 @@ cat /tmp/murmur-desktop-new/config.toml
 
 **Expected**: mnemonic saved, config with device name "desktop-creator".
 
-**Checkpoint D7**: Desktop app can create new networks independently.
+**Checkpoint D9**: Desktop app can create new networks independently.
 
 ---
 
 ### Desktop Test Cleanup
 
 ```bash
-rm -rf /tmp/murmur-a /tmp/murmur-desktop /tmp/murmur-desktop-new /tmp/test-desktop.txt
+rm -rf /tmp/murmur-a /tmp/murmur-desktop /tmp/murmur-desktop-new /tmp/test-daemon-file.txt /tmp/test-desktop.txt
 ```
 
 ### Desktop + CLI Test — Quick Reference
@@ -626,11 +686,13 @@ rm -rf /tmp/murmur-a /tmp/murmur-desktop /tmp/murmur-desktop-new /tmp/test-deskt
 |---|------|---------------|
 | D1 | Daemon network | Daemon running, 1 device, healthy status |
 | D2 | Desktop join | Setup screen, join mode, transitions to Devices tab |
-| D3 | Desktop add file | File in list, blob on disk |
-| D4 | Filesystem state | config.toml, mnemonic, device.key, db/ all present |
-| D5 | Status UI | Device ID, entry count, file count, event log correct |
-| D6 | Restart persistence | State intact after relaunch |
-| D7 | Desktop create network | Fresh network created, mnemonic saved |
+| D3 | Device approval | Desktop pending on CLI, approved, both sides see both devices |
+| D4 | File sync CLI→Desktop | File added on CLI appears on desktop |
+| D5 | File sync Desktop→CLI | File added on desktop appears on CLI, blob on disk |
+| D6 | Filesystem state | config.toml, mnemonic, device.key, db/ all present |
+| D7 | Status UI | Device ID, entry count, file count, event log correct |
+| D8 | Restart persistence | State intact after relaunch |
+| D9 | Desktop create network | Fresh network created, mnemonic saved |
 
 ---
 
