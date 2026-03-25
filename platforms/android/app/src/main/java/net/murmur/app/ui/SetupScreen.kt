@@ -1,8 +1,10 @@
 package net.murmur.app.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -14,6 +16,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -21,29 +24,47 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
 import uniffi.murmur.newMnemonic
 
 /**
- * First-run screen.
+ * First-run screen with a two-step wizard.
  *
- * The user enters a device name and either:
- *  - Creates a new network (generates and displays a mnemonic), or
- *  - Joins an existing network (enters the mnemonic).
+ * Step 1: Choose between "Create Network" and "Join Network".
+ * Step 2: Fill in the form (device name + mnemonic generation/input).
  */
 @Composable
 fun SetupScreen(
     onCreateNetwork: (deviceName: String, mnemonic: String) -> Unit,
     onJoinNetwork: (deviceName: String, mnemonic: String) -> Unit
 ) {
-    var deviceName by remember { mutableStateOf("") }
-    var mnemonic by remember { mutableStateOf("") }
-    var isJoining by remember { mutableStateOf(false) }
-    var generatedMnemonic by remember { mutableStateOf<String?>(null) }
-    var error by remember { mutableStateOf<String?>(null) }
+    // null = step 1 (choose mode), false = create form, true = join form
+    var isJoining by remember { mutableStateOf<Boolean?>(null) }
 
+    if (isJoining == null) {
+        SetupChooseStep(
+            onCreateChosen = { isJoining = false },
+            onJoinChosen = { isJoining = true }
+        )
+    } else {
+        SetupFormStep(
+            isJoining = isJoining!!,
+            onBack = { isJoining = null },
+            onCreateNetwork = onCreateNetwork,
+            onJoinNetwork = onJoinNetwork
+        )
+    }
+}
+
+/** Step 1: Choose between Create and Join. */
+@Composable
+private fun SetupChooseStep(
+    onCreateChosen: () -> Unit,
+    onJoinChosen: () -> Unit
+) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -58,7 +79,54 @@ fun SetupScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
-        Spacer(Modifier.height(32.dp))
+        Spacer(Modifier.height(48.dp))
+
+        Button(
+            onClick = onCreateChosen,
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Create Network") }
+
+        Spacer(Modifier.height(12.dp))
+
+        OutlinedButton(
+            onClick = onJoinChosen,
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Join Network") }
+    }
+}
+
+/** Step 2: Device name + mnemonic form. */
+@Composable
+private fun SetupFormStep(
+    isJoining: Boolean,
+    onBack: () -> Unit,
+    onCreateNetwork: (deviceName: String, mnemonic: String) -> Unit,
+    onJoinNetwork: (deviceName: String, mnemonic: String) -> Unit
+) {
+    var deviceName by remember { mutableStateOf("") }
+    var mnemonic by remember { mutableStateOf("") }
+    var generatedMnemonic by remember { mutableStateOf<String?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val context = LocalContext.current
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        TextButton(
+            onClick = onBack,
+            modifier = Modifier.align(Alignment.Start)
+        ) { Text("Back") }
+
+        Text(
+            if (isJoining) "Join Network" else "Create Network",
+            style = MaterialTheme.typography.headlineMedium
+        )
+
+        Spacer(Modifier.height(24.dp))
 
         OutlinedTextField(
             value = deviceName,
@@ -75,19 +143,6 @@ fun SetupScreen(
 
         Spacer(Modifier.height(16.dp))
 
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(
-                onClick = { isJoining = false; generatedMnemonic = null },
-                modifier = Modifier.weight(1f)
-            ) { Text("Create network") }
-            Button(
-                onClick = { isJoining = true; generatedMnemonic = null },
-                modifier = Modifier.weight(1f)
-            ) { Text("Join network") }
-        }
-
-        Spacer(Modifier.height(16.dp))
-
         if (isJoining) {
             OutlinedTextField(
                 value = mnemonic,
@@ -98,24 +153,35 @@ fun SetupScreen(
                 minLines = 3,
                 maxLines = 5
             )
-        }
+        } else {
+            Button(
+                onClick = { generatedMnemonic = newMnemonic() },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Generate Mnemonic") }
 
-        // Show generated mnemonic for the "Create" flow.
-        generatedMnemonic?.let { m ->
-            Spacer(Modifier.height(8.dp))
-            Text(
-                "Write down your recovery phrase:",
-                style = MaterialTheme.typography.labelMedium
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                m,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 8.dp)
-            )
+            generatedMnemonic?.let { m ->
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Write down your recovery phrase:",
+                    style = MaterialTheme.typography.labelMedium
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    m,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp)
+                )
+                OutlinedButton(
+                    onClick = {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Murmur mnemonic", m))
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Copy to clipboard") }
+            }
         }
 
         error?.let {
@@ -149,7 +215,11 @@ fun SetupScreen(
             },
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text(if (isJoining) "Join" else if (generatedMnemonic == null) "Generate & Create" else "Create")
+            Text(
+                if (isJoining) "Join"
+                else if (generatedMnemonic == null) "Generate & Create"
+                else "Create"
+            )
         }
     }
 }

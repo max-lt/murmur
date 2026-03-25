@@ -200,7 +200,8 @@ class MainActivity : ComponentActivity() {
                             ) { CircularProgressIndicator() }
 
                             selectedTab == 0 -> DeviceScreen(
-                                viewModel = remember(engine) { DeviceViewModel(engine) }
+                                viewModel = remember(engine) { DeviceViewModel(engine) },
+                                myDeviceIdHex = engine.deviceIdHex()
                             )
 
                             selectedTab == 1 -> FileScreen(

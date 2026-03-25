@@ -1,3 +1,5 @@
+@file:Suppress("DEPRECATION", "DEPRECATION_ERROR")
+
 import java.io.ByteArrayOutputStream
 
 plugins {
@@ -51,7 +53,7 @@ android {
 
     packaging {
         jniLibs {
-            useLegacyPackaging = false  // enables compressed .so → smaller APK
+            useLegacyPackaging = false  // enables compressed .so -> smaller APK
         }
     }
 

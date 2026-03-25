@@ -34,12 +34,15 @@ import uniffi.murmur.DeviceInfoFfi
  * - Approved devices: revoke button
  */
 @Composable
-fun DeviceScreen(viewModel: DeviceViewModel) {
+fun DeviceScreen(viewModel: DeviceViewModel, myDeviceIdHex: String) {
     val devices by viewModel.devices.collectAsState()
     val pendingRequests by viewModel.pendingRequests.collectAsState()
     val error by viewModel.error.collectAsState()
 
     var revokeTarget by remember { mutableStateOf<DeviceInfoFfi?>(null) }
+
+    // Other approved devices, excluding the current device.
+    val otherApproved = devices.filter { it.approved && hex(it.deviceId) != myDeviceIdHex }
 
     Column(modifier = Modifier.padding(16.dp)) {
 
@@ -67,14 +70,18 @@ fun DeviceScreen(viewModel: DeviceViewModel) {
             Spacer(Modifier.height(16.dp))
         }
 
-        Text("Devices (${devices.count { it.approved }})", style = MaterialTheme.typography.titleMedium)
+        Text("Other Devices (${otherApproved.size})", style = MaterialTheme.typography.titleMedium)
         Spacer(Modifier.height(8.dp))
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(devices.filter { it.approved }) { device ->
-                ApprovedDeviceCard(
-                    device = device,
-                    onRevoke = { revokeTarget = device }
-                )
+        if (otherApproved.isEmpty()) {
+            Text("No other devices.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        } else {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(otherApproved) { device ->
+                    ApprovedDeviceCard(
+                        device = device,
+                        onRevoke = { revokeTarget = device }
+                    )
+                }
             }
         }
     }
