@@ -8,6 +8,7 @@ murmur-types = { workspace = true }
 murmur-seed = { workspace = true }
 murmur-dag = { workspace = true }
 murmur-engine = { workspace = true }
+murmur-net = { workspace = true }
 blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
 serde = { workspace = true }
@@ -18,6 +19,12 @@ fjall = { workspace = true }
 anyhow = { workspace = true }
 toml = { workspace = true }
 tracing-subscriber = { workspace = true }
+iroh = { workspace = true }
+iroh-gossip = { workspace = true }
+futures-lite = { workspace = true }
+bytes = { workspace = true }
+postcard = { workspace = true }
+rand = { workspace = true }
 iced = { version = "0.14", features = ["tokio"] }
 
 [dev-dependencies]

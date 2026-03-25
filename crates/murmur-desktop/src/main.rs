@@ -4,9 +4,11 @@
 //! Provides a graphical interface for device management, file syncing,
 //! and network status.
 
+mod networking;
 mod storage;
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use iced::widget::{button, column, container, row, rule, scrollable, text, text_input};
@@ -32,6 +34,7 @@ fn main() -> iced::Result {
     iced::application(App::default, App::update, App::view)
         .title("Murmur")
         .theme(App::theme)
+        .subscription(App::subscription)
         .window_size(iced::Size::new(960.0, 640.0))
         .run()
 }
@@ -70,14 +73,18 @@ struct App {
     generated_mnemonic: Option<String>,
     setup_error: Option<String>,
 
-    // Engine (populated after setup)
-    engine: Option<MurmurEngine>,
+    // Engine (populated after setup) — wrapped in Arc<Mutex<>> for networking.
+    engine: Option<Arc<Mutex<MurmurEngine>>>,
     storage: Option<Arc<Storage>>,
     events_queue: Arc<Mutex<Vec<EngineEvent>>>,
 
     // Network info (populated after setup/load)
     network_id: Option<NetworkId>,
     config_device_name: Option<String>,
+
+    // Networking
+    tokio_rt: Option<tokio::runtime::Runtime>,
+    net_state: Option<networking::NetworkState>,
 
     // Derived UI state
     devices: Vec<DeviceInfo>,
@@ -118,6 +125,8 @@ impl Default for App {
             events_queue: Arc::new(Mutex::new(Vec::new())),
             network_id: None,
             config_device_name: None,
+            tokio_rt: None,
+            net_state: None,
             devices: Vec::new(),
             pending: Vec::new(),
             files: Vec::new(),
@@ -165,6 +174,9 @@ enum Message {
     DisconnectRequested,
     DisconnectConfirmed,
     DisconnectCancelled,
+
+    // Periodic refresh for networking events
+    Tick,
 }
 
 // ---------------------------------------------------------------------------
@@ -221,32 +233,46 @@ impl App {
                 self.refresh_state();
             }
             Message::ApproveDevice(idx) => {
-                if let Some(dev) = self.pending.get(idx).cloned()
-                    && let Some(engine) = &mut self.engine
-                {
-                    match engine.approve_device(dev.device_id, DeviceRole::Full) {
-                        Ok(_) => {
-                            self.event_log
-                                .push(format!("Approved device: {}", dev.name));
+                if let Some(dev) = self.pending.get(idx).cloned() {
+                    let entry_bytes = {
+                        let engine = self.engine.as_ref().unwrap();
+                        let mut eng = engine.lock().unwrap();
+                        match eng.approve_device(dev.device_id, DeviceRole::Full) {
+                            Ok(entry) => {
+                                self.event_log
+                                    .push(format!("Approved device: {}", dev.name));
+                                Some(entry.to_bytes())
+                            }
+                            Err(e) => {
+                                self.event_log.push(format!("Error approving: {e}"));
+                                None
+                            }
                         }
-                        Err(e) => {
-                            self.event_log.push(format!("Error approving: {e}"));
-                        }
+                    };
+                    if let Some(bytes) = entry_bytes {
+                        self.broadcast_entry(bytes);
                     }
                     self.refresh_state();
                 }
             }
             Message::RevokeDevice(idx) => {
-                if let Some(dev) = self.devices.get(idx).cloned()
-                    && let Some(engine) = &mut self.engine
-                {
-                    match engine.revoke_device(dev.device_id) {
-                        Ok(_) => {
-                            self.event_log.push(format!("Revoked device: {}", dev.name));
+                if let Some(dev) = self.devices.get(idx).cloned() {
+                    let entry_bytes = {
+                        let engine = self.engine.as_ref().unwrap();
+                        let mut eng = engine.lock().unwrap();
+                        match eng.revoke_device(dev.device_id) {
+                            Ok(entry) => {
+                                self.event_log.push(format!("Revoked device: {}", dev.name));
+                                Some(entry.to_bytes())
+                            }
+                            Err(e) => {
+                                self.event_log.push(format!("Error revoking: {e}"));
+                                None
+                            }
                         }
-                        Err(e) => {
-                            self.event_log.push(format!("Error revoking: {e}"));
-                        }
+                    };
+                    if let Some(bytes) = entry_bytes {
+                        self.broadcast_entry(bytes);
                     }
                     self.refresh_state();
                 }
@@ -255,8 +281,13 @@ impl App {
                 self.file_path_input = path;
             }
             Message::AddFile => {
-                if let Err(e) = self.add_file_from_path() {
-                    self.event_log.push(format!("Error adding file: {e:#}"));
+                match self.add_file_from_path() {
+                    Ok(entry_bytes) => {
+                        self.broadcast_entry(entry_bytes);
+                    }
+                    Err(e) => {
+                        self.event_log.push(format!("Error adding file: {e:#}"));
+                    }
                 }
                 self.file_path_input.clear();
                 self.refresh_state();
@@ -273,8 +304,26 @@ impl App {
                     self.event_log.push(format!("Error disconnecting: {e:#}"));
                 }
             }
+            Message::Tick => {
+                self.refresh_state();
+            }
         }
         Task::none()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subscription
+// ---------------------------------------------------------------------------
+
+impl App {
+    /// Periodic tick to refresh UI state from networking events.
+    fn subscription(&self) -> iced::Subscription<Message> {
+        if self.engine.is_some() {
+            iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::Tick)
+        } else {
+            iced::Subscription::none()
+        }
     }
 }
 
@@ -420,7 +469,7 @@ impl App {
     /// Devices tab: this device, approved + pending devices.
     fn view_devices(&self) -> Element<'_, Message> {
         let mut col = column![text("Devices").size(24)].spacing(8);
-        let my_id = self.engine.as_ref().map(|e| e.device_id());
+        let my_id = self.engine.as_ref().map(|e| e.lock().unwrap().device_id());
 
         if !self.pending.is_empty() {
             col = col.push(text("Pending Approval").size(18));
@@ -524,14 +573,24 @@ impl App {
         }
 
         if let Some(engine) = &self.engine {
-            col = col.push(text(format!("Device ID: {}", engine.device_id())));
-            col = col.push(text(format!("DAG entries: {}", engine.dag().len())));
+            let eng = engine.lock().unwrap();
+            col = col.push(text(format!("Device ID: {}", eng.device_id())));
+            col = col.push(text(format!("DAG entries: {}", eng.dag().len())));
             col = col.push(text(format!(
                 "Files: {}  Devices: {}",
                 self.files.len(),
                 self.devices.len()
             )));
         }
+
+        // Peer count from networking.
+        let peer_count = self
+            .net_state
+            .as_ref()
+            .map(|s| s.connected_peers.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        col = col.push(text(format!("Connected peers: {peer_count}")));
+
         col = col.push(text(format!("Data dir: {}", self.data_dir.display())).size(12));
 
         // Disconnect section.
@@ -626,6 +685,7 @@ impl App {
         self.config_device_name = device_name;
 
         let device_key_path = self.data_dir.join("device.key");
+        let is_creator = !device_key_path.exists();
         let (device_id, signing_key) = if device_key_path.exists() {
             let bytes: [u8; 32] = std::fs::read(&device_key_path)?
                 .try_into()
@@ -656,6 +716,20 @@ impl App {
             engine.load_entry_bytes(&entry_bytes)?;
         }
 
+        let engine = Arc::new(Mutex::new(engine));
+
+        // Start networking.
+        let topic = murmur_net::topic_from_network_id(&identity.network_id());
+        let creator_iroh_key = identity.creator_iroh_key_bytes();
+        self.start_networking(
+            engine.clone(),
+            storage.clone(),
+            device_id,
+            creator_iroh_key,
+            is_creator,
+            topic,
+        );
+
         self.storage = Some(storage);
         self.engine = Some(engine);
         self.refresh_state();
@@ -682,6 +756,7 @@ impl App {
         self.network_id = Some(identity.network_id());
         self.config_device_name = Some(self.device_name.clone());
 
+        let is_creator = !self.join_mode;
         let (device_id, signing_key) = if self.join_mode {
             let kp = murmur_seed::DeviceKeyPair::generate();
             std::fs::write(self.data_dir.join("device.key"), kp.to_bytes())?;
@@ -731,6 +806,20 @@ impl App {
 
         storage.flush()?;
 
+        let engine = Arc::new(Mutex::new(engine));
+
+        // Start networking.
+        let topic = murmur_net::topic_from_network_id(&identity.network_id());
+        let creator_iroh_key = identity.creator_iroh_key_bytes();
+        self.start_networking(
+            engine.clone(),
+            storage.clone(),
+            device_id,
+            creator_iroh_key,
+            is_creator,
+            topic,
+        );
+
         self.storage = Some(storage);
         self.engine = Some(engine);
         self.refresh_state();
@@ -738,8 +827,53 @@ impl App {
         Ok(())
     }
 
-    /// Add a file from a local filesystem path.
-    fn add_file_from_path(&mut self) -> anyhow::Result<()> {
+    /// Start the networking layer in a dedicated tokio runtime.
+    fn start_networking(
+        &mut self,
+        engine: Arc<Mutex<MurmurEngine>>,
+        storage: Arc<Storage>,
+        device_id: murmur_types::DeviceId,
+        creator_iroh_key_bytes: [u8; 32],
+        is_creator: bool,
+        topic: iroh_gossip::TopicId,
+    ) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("create tokio runtime");
+
+        match rt.block_on(networking::start_networking(
+            engine,
+            storage,
+            device_id,
+            creator_iroh_key_bytes,
+            is_creator,
+            topic,
+        )) {
+            Ok(state) => {
+                self.net_state = Some(state);
+                tracing::info!("desktop networking started");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to start networking");
+                self.event_log.push(format!("Networking failed: {e:#}"));
+            }
+        }
+
+        self.tokio_rt = Some(rt);
+    }
+
+    /// Broadcast a DAG entry to peers via gossip.
+    fn broadcast_entry(&self, entry_bytes: Vec<u8>) {
+        if let Some(ref net) = self.net_state
+            && let Err(e) = net.broadcast_tx.send(entry_bytes)
+        {
+            tracing::warn!(error = %e, "failed to send entry to broadcast channel");
+        }
+    }
+
+    /// Add a file from a local filesystem path. Returns the entry bytes for broadcasting.
+    fn add_file_from_path(&mut self) -> anyhow::Result<Vec<u8>> {
         let path = PathBuf::from(&self.file_path_input);
         if !path.exists() {
             anyhow::bail!("file not found: {}", path.display());
@@ -764,8 +898,9 @@ impl App {
 
         let engine = self
             .engine
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("engine not initialized"))?;
+        let mut eng = engine.lock().unwrap();
 
         let metadata = FileMetadata {
             blob_hash,
@@ -776,18 +911,28 @@ impl App {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            device_origin: engine.device_id(),
+            device_origin: eng.device_id(),
         };
 
-        engine.add_file(metadata, data)?;
+        let entry = eng.add_file(metadata, data)?;
         self.event_log.push(format!("Added file: {filename}"));
 
-        Ok(())
+        Ok(entry.to_bytes())
     }
 
     /// Disconnect from the current network by clearing all local state.
     fn disconnect_network(&mut self) -> anyhow::Result<()> {
-        // Drop engine and storage first so file handles are released.
+        // Stop networking first.
+        if let Some(net) = self.net_state.take()
+            && let Some(ref rt) = self.tokio_rt
+        {
+            rt.block_on(net.close());
+        }
+        if let Some(rt) = self.tokio_rt.take() {
+            rt.shutdown_background();
+        }
+
+        // Drop engine and storage so file handles are released.
         self.engine = None;
         self.storage = None;
 
@@ -819,9 +964,10 @@ impl App {
     /// Refresh derived UI state from the engine.
     fn refresh_state(&mut self) {
         if let Some(engine) = &self.engine {
-            self.devices = engine.list_devices();
-            self.pending = engine.pending_requests();
-            self.files = engine.state().files.values().cloned().collect();
+            let eng = engine.lock().unwrap();
+            self.devices = eng.list_devices();
+            self.pending = eng.pending_requests();
+            self.files = eng.state().files.values().cloned().collect();
         }
         // Drain event queue.
         if let Ok(mut events) = self.events_queue.lock() {
