@@ -80,15 +80,27 @@ impl Storage {
         Ok(())
     }
 
-    /// Load all persisted DAG entries (for feeding into the engine on startup).
+    /// Load all persisted DAG entries sorted by (HLC, DeviceId) for deterministic replay.
+    ///
+    /// Fjall iteration order is not guaranteed to match insertion order, so we
+    /// deserialize each entry to extract its HLC and device ID, then sort.
+    /// This ensures dependent actions (e.g. DeviceRevoked) are always replayed
+    /// after their prerequisites (e.g. DeviceApproved).
     pub fn load_all_dag_entries(&self) -> Result<Vec<Vec<u8>>> {
-        let mut entries = Vec::new();
+        use murmur_dag::DagEntry;
+
+        let mut entries: Vec<(u64, murmur_types::DeviceId, Vec<u8>)> = Vec::new();
         for guard in self.dag_ks.iter() {
             let (_key, value) = guard.into_inner().context("iterate dag entries")?;
-            entries.push(value.to_vec());
+            let bytes = value.to_vec();
+            let entry =
+                DagEntry::from_bytes(&bytes).context("deserialize dag entry for sorting")?;
+            entries.push((entry.hlc, entry.device_id, bytes));
         }
-        info!(count = entries.len(), "loaded dag entries from storage");
-        Ok(entries)
+        entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let sorted: Vec<Vec<u8>> = entries.into_iter().map(|(_, _, bytes)| bytes).collect();
+        info!(count = sorted.len(), "loaded dag entries from storage");
+        Ok(sorted)
     }
 
     /// Store a blob to the filesystem (content-addressed).
