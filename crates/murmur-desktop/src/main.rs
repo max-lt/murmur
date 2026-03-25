@@ -13,7 +13,7 @@ use iced::widget::{button, column, container, row, rule, scrollable, text, text_
 use iced::{Element, Length, Task, Theme};
 
 use murmur_engine::{EngineEvent, MurmurEngine};
-use murmur_types::{BlobHash, DeviceInfo, DeviceRole, FileMetadata};
+use murmur_types::{BlobHash, DeviceInfo, DeviceRole, FileMetadata, NetworkId};
 
 use storage::{DesktopPlatform, Storage};
 
@@ -49,11 +49,21 @@ enum Screen {
     Status,
 }
 
+/// Setup wizard step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SetupStep {
+    /// Choose between Create or Join.
+    ChooseMode,
+    /// Fill in the form (device name, mnemonic).
+    Form,
+}
+
 /// Application state.
 struct App {
     screen: Screen,
 
     // Setup
+    setup_step: SetupStep,
     device_name: String,
     mnemonic_input: String,
     join_mode: bool,
@@ -65,6 +75,10 @@ struct App {
     storage: Option<Arc<Storage>>,
     events_queue: Arc<Mutex<Vec<EngineEvent>>>,
 
+    // Network info (populated after setup/load)
+    network_id: Option<NetworkId>,
+    config_device_name: Option<String>,
+
     // Derived UI state
     devices: Vec<DeviceInfo>,
     pending: Vec<DeviceInfo>,
@@ -73,6 +87,9 @@ struct App {
 
     // File add
     file_path_input: String,
+
+    // Disconnect confirmation
+    confirm_disconnect: bool,
 
     // Persistent data directory
     data_dir: PathBuf,
@@ -90,6 +107,7 @@ impl Default for App {
 
         let mut app = Self {
             screen: Screen::Setup,
+            setup_step: SetupStep::ChooseMode,
             device_name: String::new(),
             mnemonic_input: String::new(),
             join_mode: false,
@@ -98,11 +116,14 @@ impl Default for App {
             engine: None,
             storage: None,
             events_queue: Arc::new(Mutex::new(Vec::new())),
+            network_id: None,
+            config_device_name: None,
             devices: Vec::new(),
             pending: Vec::new(),
             files: Vec::new(),
             event_log: Vec::new(),
             file_path_input: String::new(),
+            confirm_disconnect: false,
             data_dir,
         };
 
@@ -120,10 +141,13 @@ impl Default for App {
 #[derive(Debug, Clone)]
 enum Message {
     // Setup
+    SetupChooseCreate,
+    SetupChooseJoin,
+    SetupBack,
     DeviceNameChanged(String),
     MnemonicInputChanged(String),
-    ToggleJoinMode,
     GenerateMnemonic,
+    CopyMnemonic,
     CreateOrJoinNetwork,
 
     // Navigation
@@ -136,6 +160,11 @@ enum Message {
     // Files
     FilePathChanged(String),
     AddFile,
+
+    // Network
+    DisconnectRequested,
+    DisconnectConfirmed,
+    DisconnectCancelled,
 }
 
 // ---------------------------------------------------------------------------
@@ -145,20 +174,36 @@ enum Message {
 impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::SetupChooseCreate => {
+                self.join_mode = false;
+                self.setup_step = SetupStep::Form;
+                self.generated_mnemonic = None;
+                self.setup_error = None;
+            }
+            Message::SetupChooseJoin => {
+                self.join_mode = true;
+                self.setup_step = SetupStep::Form;
+                self.generated_mnemonic = None;
+                self.setup_error = None;
+            }
+            Message::SetupBack => {
+                self.setup_step = SetupStep::ChooseMode;
+                self.setup_error = None;
+            }
             Message::DeviceNameChanged(name) => {
                 self.device_name = name;
             }
             Message::MnemonicInputChanged(input) => {
                 self.mnemonic_input = input;
             }
-            Message::ToggleJoinMode => {
-                self.join_mode = !self.join_mode;
-                self.generated_mnemonic = None;
-                self.setup_error = None;
-            }
             Message::GenerateMnemonic => {
                 let m = murmur_seed::generate_mnemonic(murmur_seed::WordCount::TwentyFour);
                 self.generated_mnemonic = Some(m.to_string());
+            }
+            Message::CopyMnemonic => {
+                if let Some(ref m) = self.generated_mnemonic {
+                    return iced::clipboard::write(m.clone());
+                }
             }
             Message::CreateOrJoinNetwork => {
                 self.setup_error = None;
@@ -216,6 +261,18 @@ impl App {
                 self.file_path_input.clear();
                 self.refresh_state();
             }
+            Message::DisconnectRequested => {
+                self.confirm_disconnect = true;
+            }
+            Message::DisconnectCancelled => {
+                self.confirm_disconnect = false;
+            }
+            Message::DisconnectConfirmed => {
+                self.confirm_disconnect = false;
+                if let Err(e) = self.disconnect_network() {
+                    self.event_log.push(format!("Error disconnecting: {e:#}"));
+                }
+            }
         }
         Task::none()
     }
@@ -237,33 +294,53 @@ impl App {
         Theme::Dark
     }
 
-    /// Setup screen: create or join a Murmur network.
+    /// Setup screen: two-step wizard.
     fn view_setup(&self) -> Element<'_, Message> {
-        let title = text("Murmur").size(32);
-        let subtitle = text("Private Device Sync Network").size(16);
+        match self.setup_step {
+            SetupStep::ChooseMode => self.view_setup_choose(),
+            SetupStep::Form => self.view_setup_form(),
+        }
+    }
+
+    /// Step 1: choose Create or Join.
+    fn view_setup_choose(&self) -> Element<'_, Message> {
+        let col = column![
+            text("Murmur").size(32),
+            text("Private Device Sync Network").size(16),
+            rule::horizontal(1),
+            button(text("Create Network").width(Length::Fill))
+                .width(Length::Fill)
+                .on_press(Message::SetupChooseCreate),
+            button(text("Join Network").width(Length::Fill))
+                .width(Length::Fill)
+                .on_press(Message::SetupChooseJoin),
+        ]
+        .spacing(16)
+        .padding(30)
+        .max_width(400);
+
+        container(col)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into()
+    }
+
+    /// Step 2: device name + mnemonic form.
+    fn view_setup_form(&self) -> Element<'_, Message> {
+        let title = if self.join_mode {
+            "Join Network"
+        } else {
+            "Create Network"
+        };
 
         let name_input = text_input("Device name (e.g., My Desktop)", &self.device_name)
             .on_input(Message::DeviceNameChanged)
             .padding(10);
 
-        let mode_label = if self.join_mode {
-            "Join existing network"
-        } else {
-            "Create new network"
-        };
-        let toggle_label = if self.join_mode {
-            "Switch to Create"
-        } else {
-            "Switch to Join"
-        };
-        let mode_btn = button(text(toggle_label)).on_press(Message::ToggleJoinMode);
-
         let mut col = column![
-            title,
-            subtitle,
+            button(text("Back")).on_press(Message::SetupBack),
+            text(title).size(24),
             rule::horizontal(1),
-            text(mode_label).size(18),
-            mode_btn,
             name_input,
         ]
         .spacing(12)
@@ -279,7 +356,9 @@ impl App {
         } else {
             col = col.push(button(text("Generate Mnemonic")).on_press(Message::GenerateMnemonic));
             if let Some(ref m) = self.generated_mnemonic {
+                col = col.push(text("Write down your recovery phrase:").size(14));
                 col = col.push(container(text(m).size(14)).padding(10).width(Length::Fill));
+                col = col.push(button(text("Copy to clipboard")).on_press(Message::CopyMnemonic));
             }
         }
 
@@ -290,11 +369,7 @@ impl App {
                 self.generated_mnemonic.is_some()
             };
 
-        let action_label = if self.join_mode {
-            "Join Network"
-        } else {
-            "Create Network"
-        };
+        let action_label = if self.join_mode { "Join" } else { "Create" };
         let mut proceed_btn = button(text(action_label));
         if can_proceed {
             proceed_btn = proceed_btn.on_press(Message::CreateOrJoinNetwork);
@@ -342,9 +417,10 @@ impl App {
             .into()
     }
 
-    /// Devices tab: approved + pending devices.
+    /// Devices tab: this device, approved + pending devices.
     fn view_devices(&self) -> Element<'_, Message> {
         let mut col = column![text("Devices").size(24)].spacing(8);
+        let my_id = self.engine.as_ref().map(|e| e.device_id());
 
         if !self.pending.is_empty() {
             col = col.push(text("Pending Approval").size(18));
@@ -359,16 +435,17 @@ impl App {
             col = col.push(rule::horizontal(1));
         }
 
-        col = col.push(text("Approved Devices").size(18));
+        // Other approved devices (excluding this device).
         let approved: Vec<_> = self
             .devices
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.approved)
+            .filter(|(_, d)| d.approved && Some(d.device_id) != my_id)
             .collect();
 
+        col = col.push(text("Other Devices").size(18));
         if approved.is_empty() {
-            col = col.push(text("No approved devices.").size(14));
+            col = col.push(text("No other devices.").size(14));
         } else {
             for (i, dev) in approved {
                 let r = row![
@@ -427,9 +504,24 @@ impl App {
         scrollable(col).into()
     }
 
-    /// Status tab: device info + event log.
+    /// Status tab: network info, device info, disconnect, and event log.
     fn view_status(&self) -> Element<'_, Message> {
         let mut col = column![text("Status").size(24)].spacing(8);
+
+        // Network info section.
+        col = col.push(text("Network").size(18));
+        if let Some(nid) = &self.network_id {
+            let nid_hex = nid.to_string();
+            let short = if nid_hex.len() > 16 {
+                format!("{}...", &nid_hex[..16])
+            } else {
+                nid_hex
+            };
+            col = col.push(text(format!("Network ID: {short}")));
+        }
+        if let Some(name) = &self.config_device_name {
+            col = col.push(text(format!("Device name: {name}")));
+        }
 
         if let Some(engine) = &self.engine {
             col = col.push(text(format!("Device ID: {}", engine.device_id())));
@@ -439,7 +531,31 @@ impl App {
                 self.files.len(),
                 self.devices.len()
             )));
-            col = col.push(text(format!("Data dir: {}", self.data_dir.display())));
+        }
+        col = col.push(text(format!("Data dir: {}", self.data_dir.display())).size(12));
+
+        // Disconnect section.
+        col = col.push(rule::horizontal(1));
+        if self.confirm_disconnect {
+            col = col.push(
+                text("This will delete all local network data. Are you sure?")
+                    .color([1.0, 0.3, 0.3]),
+            );
+            col = col.push(
+                row![
+                    button(text("Yes, disconnect"))
+                        .on_press(Message::DisconnectConfirmed)
+                        .style(button::danger),
+                    button(text("Cancel")).on_press(Message::DisconnectCancelled),
+                ]
+                .spacing(8),
+            );
+        } else {
+            col = col.push(
+                button(text("Disconnect from network"))
+                    .on_press(Message::DisconnectRequested)
+                    .style(button::danger),
+            );
         }
 
         col = col.push(rule::horizontal(1));
@@ -496,9 +612,18 @@ impl App {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing storage.blob_dir"))?;
 
+        let device_name = config
+            .get("device")
+            .and_then(|d| d.get("name"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
         let mnemonic_str = std::fs::read_to_string(self.data_dir.join("mnemonic"))?;
         let mnemonic = murmur_seed::parse_mnemonic(mnemonic_str.trim())?;
         let identity = murmur_seed::NetworkIdentity::from_mnemonic(&mnemonic, "");
+
+        self.network_id = Some(identity.network_id());
+        self.config_device_name = device_name;
 
         let device_key_path = self.data_dir.join("device.key");
         let (device_id, signing_key) = if device_key_path.exists() {
@@ -553,6 +678,9 @@ impl App {
         };
 
         let identity = murmur_seed::NetworkIdentity::from_mnemonic(&mnemonic, "");
+
+        self.network_id = Some(identity.network_id());
+        self.config_device_name = Some(self.device_name.clone());
 
         let (device_id, signing_key) = if self.join_mode {
             let kp = murmur_seed::DeviceKeyPair::generate();
@@ -653,6 +781,37 @@ impl App {
 
         engine.add_file(metadata, data)?;
         self.event_log.push(format!("Added file: {filename}"));
+
+        Ok(())
+    }
+
+    /// Disconnect from the current network by clearing all local state.
+    fn disconnect_network(&mut self) -> anyhow::Result<()> {
+        // Drop engine and storage first so file handles are released.
+        self.engine = None;
+        self.storage = None;
+
+        // Remove all data files.
+        if self.data_dir.exists() {
+            std::fs::remove_dir_all(&self.data_dir)?;
+            tracing::info!(dir = %self.data_dir.display(), "removed network data");
+        }
+
+        // Reset UI state.
+        self.network_id = None;
+        self.config_device_name = None;
+        self.devices.clear();
+        self.pending.clear();
+        self.files.clear();
+        self.event_log.clear();
+        self.device_name.clear();
+        self.mnemonic_input.clear();
+        self.generated_mnemonic = None;
+        self.setup_error = None;
+        self.join_mode = false;
+        self.setup_step = SetupStep::ChooseMode;
+        self.file_path_input.clear();
+        self.screen = Screen::Setup;
 
         Ok(())
     }
