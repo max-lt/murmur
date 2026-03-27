@@ -64,6 +64,8 @@ Desktop only (in `murmurd`, the server daemon):
 | ----------- | ---------------------------- |
 | Metadata DB | `fjall` v3 (DAG persistence) |
 | CLI         | `clap`                       |
+| FS watching | `notify` 8                   |
+| Ignore      | `ignore` 0.4                 |
 
 IMPORTANT: Never add a dependency that requires C/C++ compilation or `cc` build script in the core crates. If unsure, check the dep's build.rs before adding.
 
@@ -179,9 +181,9 @@ When fixing a reported bug:
 4. Run the test to confirm it passes
 5. Run the full test suite to ensure no regressions
 
-## Folder Sync Architecture (Milestones 13–20)
+## Folder Sync Architecture
 
-Murmur is evolving into a Syncthing-style folder sync app. Key design decisions:
+Murmur is a Syncthing-style folder sync app. Milestones 13–16 (folder model, conflicts, streaming blobs, filesystem watching) are complete. Key design decisions:
 
 - **Shared folders** map to real directories on each device. murmurd watches them with `notify`.
 - **Per-device subscribe model**: each device chooses which folders to sync and whether read-write or read-only.

@@ -574,12 +574,23 @@ fn hex_short(bytes: &[u8]) -> String {
 /// Platform callbacks implementation backed by [`Storage`].
 pub struct FjallPlatform {
     storage: Arc<Storage>,
+    /// Optional channel to forward engine events (e.g., for reverse sync).
+    event_tx:
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<murmur_engine::EngineEvent>>>,
 }
 
 impl FjallPlatform {
     /// Create a new platform callbacks instance.
     pub fn new(storage: Arc<Storage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            event_tx: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Set the event channel for forwarding engine events.
+    pub fn set_event_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<murmur_engine::EngineEvent>) {
+        *self.event_tx.lock().unwrap() = Some(tx);
     }
 }
 
@@ -608,6 +619,9 @@ impl murmur_engine::PlatformCallbacks for FjallPlatform {
 
     fn on_event(&self, event: murmur_engine::EngineEvent) {
         info!(?event, "engine event");
+        if let Some(tx) = self.event_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(event);
+        }
     }
 
     fn on_blob_stream_start(&self, blob_hash: BlobHash, total_size: u64) {

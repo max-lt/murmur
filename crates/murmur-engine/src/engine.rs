@@ -1183,6 +1183,12 @@ impl MurmurEngine {
                     new_hash: *new_hash,
                 });
             }
+            Action::FileDeleted { folder_id, path } => {
+                self.callbacks.on_event(EngineEvent::FileDeleted {
+                    folder_id: *folder_id,
+                    path: path.clone(),
+                });
+            }
             Action::AccessGranted { grant } => {
                 self.callbacks
                     .on_event(EngineEvent::AccessGranted { to: grant.to });

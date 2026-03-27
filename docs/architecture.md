@@ -224,7 +224,7 @@ The orchestrator tying DAG, network, and platform together. Storage-agnostic.
 - `on_blob_stream_complete(blob_hash) → Result<(), String>` — verify and finalize streaming blob
 - `on_blob_stream_abort(blob_hash)` — clean up aborted streaming transfer
 
-**EngineEvent** — 15 variants: `DeviceJoinRequested`, `DeviceApproved`, `DeviceRevoked`, `FolderCreated`, `FolderSubscribed`, `FileSynced`, `FileModified`, `BlobReceived`, `AccessRequested`, `AccessGranted`, `DagSynced`, `NetworkCreated`, `NetworkJoined`, `BlobTransferProgress`, `ConflictDetected`.
+**EngineEvent** — 16 variants: `DeviceJoinRequested`, `DeviceApproved`, `DeviceRevoked`, `FolderCreated`, `FolderSubscribed`, `FileSynced`, `FileModified`, `FileDeleted`, `BlobReceived`, `AccessRequested`, `AccessGranted`, `DagSynced`, `NetworkCreated`, `NetworkJoined`, `BlobTransferProgress`, `ConflictDetected`.
 
 ### murmur-ffi
 
@@ -267,6 +267,10 @@ Headless daemon for NAS, Raspberry Pi, or VPS. Pure daemon — no subcommands, m
 - **Gossip networking**: creates an iroh endpoint, subscribes to a gossip topic derived from the network ID. Creator uses a deterministic iroh key (HKDF from mnemonic); joining devices use a random key and bootstrap with the creator's endpoint ID. DAG entries broadcast via gossip with deflate compression (shared wire format from `murmur-net`). On `NeighborUp`, peers exchange `DagSyncRequest` with their tips and receive only the delta. When a `FileAdded` entry arrives, the daemon requests missing blobs via `BlobRequest`/`BlobResponse`; large blobs (>4 MiB) use chunked transfer via `BlobChunk` messages with 5ms pacing between chunks.
 - **Streaming blob storage**: incoming `BlobChunk` messages are written directly to a temp file (`~/.murmur/blobs/.tmp/`) instead of being reassembled in memory. On completion, streaming blake3 verification runs without loading the full file. For unencrypted blobs, atomic rename to final path. For encrypted blobs, chunked AEAD encryption (1 MiB chunks, per-chunk derived nonces, MCv1 format) keeps memory bounded.
 - **Blob encryption at rest**: AES-256-GCM. Legacy blobs use single-nonce format (12-byte nonce + ciphertext). Streaming blobs use chunked MCv1 format (magic header + base nonce + per-chunk nonces derived via XOR). Both formats are transparently handled on read.
+- **Filesystem watching** (`watcher` module): `FolderWatcher` manages one `notify::RecommendedWatcher` per subscribed folder. Events are debounced (500ms per path) and filtered through ignore patterns before being emitted. `EchoSuppressor` tracks recent reverse-sync writes (2s window) to prevent feedback loops.
+- **Bidirectional sync** (`sync` module): Forward sync translates filesystem events into engine operations (`add_file_streaming`, `modify_file`, `delete_file`). Reverse sync writes files to disk when `FileSynced`, `FileModified`, or `FileDeleted` events arrive from the network. Initial scan on startup reconciles local directory state with the DAG.
+- **Ignore patterns** (`ignore` module): `IgnoreFilter` wraps the `ignore` crate for gitignore-style pattern matching. Each folder supports a `.murmurignore` file. Built-in defaults always exclude: `.DS_Store`, `Thumbs.db`, `._*`, `*.tmp`, `*~`, `.murmurignore`, `*.conflict-*`.
+- **Folder config**: `[[folders]]` array in `config.toml` maps folder IDs to local directories with sync mode (`read-write` or `read-only`).
 - **IPC socket**: accepts `CliRequest` from `murmur-cli`, produces `CliResponse`. Handles concurrent connections. Socket cleaned up on graceful shutdown; stale sockets detected and removed on startup.
 - Signal handling: graceful shutdown on SIGTERM/SIGINT
 
@@ -430,11 +434,13 @@ Action::Snapshot { state_hash }
 
 ### Desktop only
 
-| Purpose     | Crate       |
-| ----------- | ----------- |
-| Metadata DB | `fjall` v3  |
-| CLI         | `clap` v4   |
-| Desktop UI  | `iced` 0.14 |
+| Purpose     | Crate        |
+| ----------- | ------------ |
+| Metadata DB | `fjall` v3   |
+| CLI         | `clap` v4    |
+| Desktop UI  | `iced` 0.14  |
+| FS watching | `notify` 8   |
+| Ignore      | `ignore` 0.4 |
 
 ### Android
 

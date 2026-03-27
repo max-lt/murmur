@@ -106,4 +106,11 @@ pub enum EngineEvent {
         /// The competing versions.
         versions: Vec<ConflictVersion>,
     },
+    /// A file was deleted.
+    FileDeleted {
+        /// The folder ID.
+        folder_id: FolderId,
+        /// The file's path within the folder.
+        path: String,
+    },
 }

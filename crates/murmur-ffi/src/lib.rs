@@ -168,6 +168,8 @@ pub enum MurmurEventFfi {
         path: String,
         version_count: u64,
     },
+    /// A file was deleted.
+    FileDeleted { folder_id: Vec<u8>, path: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +284,10 @@ fn engine_event_to_ffi(event: EngineEvent) -> MurmurEventFfi {
             folder_id: folder_id.as_bytes().to_vec(),
             path,
             version_count: versions.len() as u64,
+        },
+        EngineEvent::FileDeleted { folder_id, path } => MurmurEventFfi::FileDeleted {
+            folder_id: folder_id.as_bytes().to_vec(),
+            path,
         },
     }
 }

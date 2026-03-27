@@ -14,6 +14,25 @@ pub struct Config {
     /// Network behaviour.
     #[serde(default)]
     pub network: NetworkConfig,
+    /// Folder directory mappings.
+    #[serde(default)]
+    pub folders: Vec<FolderConfig>,
+}
+
+/// A folder's local directory mapping.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FolderConfig {
+    /// The hex-encoded folder ID.
+    pub folder_id: String,
+    /// Absolute path to the local directory for this folder.
+    pub local_path: PathBuf,
+    /// Sync mode: "read-write" or "read-only".
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+fn default_mode() -> String {
+    "read-write".to_string()
 }
 
 /// Device identity and role.
@@ -79,6 +98,7 @@ impl Config {
                 data_dir: base_dir.join("db"),
             },
             network: NetworkConfig::default(),
+            folders: Vec::new(),
         }
     }
 
@@ -194,6 +214,72 @@ mod tests {
         assert_eq!(Config::config_path(base), base.join("config.toml"));
         assert_eq!(Config::mnemonic_path(base), base.join("mnemonic"));
         assert_eq!(Config::device_key_path(base), base.join("device.key"));
+    }
+
+    #[test]
+    fn test_config_folder_mappings() {
+        let toml_str = r#"
+[device]
+name = "NAS"
+role = "backup"
+
+[storage]
+blob_dir = "/data/blobs"
+data_dir = "/data/db"
+
+[[folders]]
+folder_id = "abc123"
+local_path = "/home/user/Sync/Photos"
+mode = "read-write"
+
+[[folders]]
+folder_id = "def456"
+local_path = "/home/user/Sync/Documents"
+mode = "read-only"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.folders.len(), 2);
+        assert_eq!(config.folders[0].folder_id, "abc123");
+        assert_eq!(
+            config.folders[0].local_path,
+            PathBuf::from("/home/user/Sync/Photos")
+        );
+        assert_eq!(config.folders[0].mode, "read-write");
+        assert_eq!(config.folders[1].mode, "read-only");
+    }
+
+    #[test]
+    fn test_config_folders_default_empty() {
+        let toml_str = r#"
+[device]
+name = "NAS"
+role = "backup"
+
+[storage]
+blob_dir = "/data/blobs"
+data_dir = "/data/db"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.folders.is_empty());
+    }
+
+    #[test]
+    fn test_config_folder_default_mode() {
+        let toml_str = r#"
+[device]
+name = "NAS"
+role = "backup"
+
+[storage]
+blob_dir = "/data/blobs"
+data_dir = "/data/db"
+
+[[folders]]
+folder_id = "abc123"
+local_path = "/home/user/Sync/Photos"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.folders[0].mode, "read-write");
     }
 
     #[test]

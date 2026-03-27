@@ -38,6 +38,14 @@ When two devices edit the same file concurrently (a true DAG fork), Murmur detec
 
 Each device chooses which folders to sync and whether to participate as read-write or read-only. A phone might subscribe to Photos (read-write) and Documents (read-only). A NAS might subscribe to everything. A laptop might only want a few project folders. Subscriptions are self-managed — no central admin.
 
+## Automatic Filesystem Sync
+
+Drop a file into a synced folder and it's on all your devices. murmurd watches subscribed folder directories with the `notify` crate, detects changes in real time, debounces rapid writes (500ms window), and automatically creates DAG entries. The reverse direction works too — when a file arrives from the network, it's written to the local folder directory. On startup, the daemon reconciles the local directory with the DAG state so nothing is missed even if files changed while the daemon was stopped.
+
+## Ignore What You Don't Want
+
+Each shared folder supports a `.murmurignore` file with gitignore-style patterns. OS clutter (`.DS_Store`, `Thumbs.db`, `._*`, `*.tmp`) is excluded by default — no configuration needed. Conflict files (`*.conflict-*`) are also excluded to prevent sync loops. The ignore filter applies to both filesystem watching and initial scans.
+
 ## Scoped, Time-Limited Access
 
 Need to share a specific file with another device temporarily? Access grants are scoped (single file, folder prefix, or everything) and time-limited. They're signed by the grantor and expire automatically. No permanent sharing links, no "anyone with the link" footgun.

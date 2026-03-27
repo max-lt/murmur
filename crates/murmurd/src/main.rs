@@ -7,10 +7,13 @@ mod config;
 mod crypto;
 #[cfg(feature = "metrics")]
 mod http;
+mod ignore;
 mod mdns;
 mod metrics;
 mod networking;
 mod storage;
+mod sync;
+mod watcher;
 
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -21,13 +24,14 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::Parser;
 use murmur_ipc::{CliRequest, CliResponse, DeviceInfoIpc, FileInfoIpc, TransferInfoIpc};
-use murmur_types::DeviceId;
+use murmur_types::{DeviceId, FolderId, SyncMode};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
 use config::Config;
 use storage::{FjallPlatform, Storage};
+use sync::SyncedFolder;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -140,6 +144,7 @@ fn run_daemon(
     }
 
     let platform = Arc::new(FjallPlatform::new(storage.clone()));
+    let platform_ref = platform.clone();
 
     // Create engine.
     //
@@ -274,6 +279,134 @@ fn run_daemon(
         } else {
             None
         };
+
+        // Set up filesystem watching and sync for configured folders.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        platform_ref.set_event_tx(event_tx);
+
+        let (mut folder_watcher, mut watcher_rx) = watcher::FolderWatcher::new();
+        let mut synced_folders = std::collections::HashMap::new();
+
+        for fc in &config.folders {
+            let folder_id_bytes = match hex::decode(&fc.folder_id) {
+                Ok(b) if b.len() == 32 => {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&b);
+                    arr
+                }
+                _ => {
+                    warn!(folder_id = %fc.folder_id, "invalid folder_id hex in config, skipping");
+                    continue;
+                }
+            };
+            let folder_id = FolderId::from_bytes(folder_id_bytes);
+            let mode = match fc.mode.as_str() {
+                "read-only" => SyncMode::ReadOnly,
+                _ => SyncMode::ReadWrite,
+            };
+
+            // Create local directory if it doesn't exist.
+            if let Err(e) = std::fs::create_dir_all(&fc.local_path) {
+                warn!(
+                    path = %fc.local_path.display(),
+                    error = %e,
+                    "failed to create folder directory, skipping"
+                );
+                continue;
+            }
+
+            let synced = SyncedFolder {
+                folder_id,
+                local_path: fc.local_path.clone(),
+                mode,
+            };
+
+            // Run initial scan.
+            {
+                let filter = ignore::IgnoreFilter::new(&fc.local_path);
+                let mut eng = engine.lock().unwrap();
+                if let Err(e) = sync::initial_scan(
+                    &synced,
+                    &mut eng,
+                    &storage,
+                    folder_watcher.echo_suppressor(),
+                    &filter,
+                ) {
+                    error!(
+                        folder_id = %fc.folder_id,
+                        error = %e,
+                        "initial scan failed"
+                    );
+                }
+            }
+
+            // Start filesystem watcher.
+            if let Err(e) = folder_watcher.watch_folder(folder_id, &fc.local_path) {
+                error!(
+                    folder_id = %fc.folder_id,
+                    error = %e,
+                    "failed to start filesystem watcher"
+                );
+            }
+
+            synced_folders.insert(folder_id, synced);
+        }
+
+        // Clone the echo suppressor before wrapping the watcher in a mutex,
+        // so the reverse sync task can use it without locking the watcher.
+        let echo_suppressor = folder_watcher.echo_suppressor().clone();
+
+        // Spawn debounce poll task (drains ready events every 100ms).
+        let watcher_pending = Arc::new(Mutex::new(folder_watcher));
+        let watcher_for_poll = watcher_pending.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                interval.tick().await;
+                watcher_for_poll.lock().unwrap().drain_ready();
+            }
+        });
+
+        // Spawn forward sync task (filesystem events → engine).
+        let engine_for_forward = engine.clone();
+        let synced_folders_arc = Arc::new(synced_folders);
+        let folders_for_forward = synced_folders_arc.clone();
+        tokio::spawn(async move {
+            while let Some(event) = watcher_rx.recv().await {
+                let folders = folders_for_forward.clone();
+                let eng = engine_for_forward.clone();
+                // Use spawn_blocking to avoid holding the mutex across await.
+                tokio::task::spawn_blocking(move || {
+                    let mut eng = eng.lock().unwrap();
+                    if let Err(e) = sync::handle_forward_sync_event(&event, &folders, &mut eng) {
+                        error!(
+                            path = %event.relative_path,
+                            error = %e,
+                            "forward sync error"
+                        );
+                    }
+                });
+            }
+        });
+
+        // Spawn reverse sync task (engine events → filesystem).
+        let storage_for_reverse = storage.clone();
+        let folders_for_reverse = synced_folders_arc.clone();
+        let echo_for_reverse = echo_suppressor.clone();
+        tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                match sync::handle_reverse_sync_event(
+                    &event,
+                    &folders_for_reverse,
+                    &storage_for_reverse,
+                    &echo_for_reverse,
+                ) {
+                    Ok(true) => debug!("reverse sync handled event"),
+                    Ok(false) => {} // Not a file event, ignore.
+                    Err(e) => error!(error = %e, "reverse sync error"),
+                }
+            }
+        });
 
         // Spawn a task to accept socket connections.
         let ctx = Arc::new(DaemonCtx {

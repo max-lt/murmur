@@ -37,6 +37,8 @@ axum = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 mdns-sd = { workspace = true }
 hostname = { workspace = true }
+notify = { workspace = true }
+ignore = { workspace = true }
 
 [dependencies.rand]
 workspace = true
