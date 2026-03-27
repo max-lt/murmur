@@ -176,6 +176,32 @@ pub struct FolderSubscription {
     pub mode: SyncMode,
 }
 
+/// A detected conflict on a file (concurrent modifications by different devices).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictInfo {
+    /// The folder containing the conflicting file.
+    pub folder_id: FolderId,
+    /// The file path within the folder.
+    pub path: String,
+    /// The competing versions.
+    pub versions: Vec<ConflictVersion>,
+    /// HLC timestamp when the conflict was first detected.
+    pub detected_at: u64,
+}
+
+/// One side of a conflict — a specific version of the file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictVersion {
+    /// Content hash of this version.
+    pub blob_hash: BlobHash,
+    /// Device that created this version.
+    pub device_id: DeviceId,
+    /// HLC timestamp of the entry.
+    pub hlc: u64,
+    /// Hash of the DAG entry that introduced this version.
+    pub dag_entry_hash: [u8; 32],
+}
+
 // ---------------------------------------------------------------------------
 // File metadata
 // ---------------------------------------------------------------------------
@@ -317,6 +343,17 @@ pub enum Action {
         /// Relative path within the folder.
         path: String,
     },
+    /// A file conflict has been resolved.
+    ConflictResolved {
+        /// The folder containing the file.
+        folder_id: FolderId,
+        /// The file path within the folder.
+        path: String,
+        /// The chosen version's content hash.
+        chosen_hash: BlobHash,
+        /// Discarded version hashes.
+        discarded_hashes: Vec<BlobHash>,
+    },
     /// Access has been granted.
     AccessGranted {
         /// The access grant.
@@ -351,6 +388,7 @@ impl Action {
             Action::FileAdded { .. } => "FileAdded",
             Action::FileModified { .. } => "FileModified",
             Action::FileDeleted { .. } => "FileDeleted",
+            Action::ConflictResolved { .. } => "ConflictResolved",
             Action::AccessGranted { .. } => "AccessGranted",
             Action::AccessRevoked { .. } => "AccessRevoked",
             Action::Merge => "Merge",
@@ -779,6 +817,12 @@ mod tests {
             Action::FileDeleted {
                 folder_id,
                 path: "test.txt".to_string(),
+            },
+            Action::ConflictResolved {
+                folder_id,
+                path: "test.txt".to_string(),
+                chosen_hash: BlobHash::from_data(b"file2"),
+                discarded_hashes: vec![BlobHash::from_data(b"file")],
             },
             Action::AccessGranted {
                 grant: AccessGrant {

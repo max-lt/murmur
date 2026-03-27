@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use murmur_types::{
-    AccessGrant, Action, BlobHash, DeviceId, DeviceInfo, DeviceRole, FileMetadata, FolderId,
-    FolderSubscription, SharedFolder,
+    AccessGrant, Action, BlobHash, ConflictInfo, DeviceId, DeviceInfo, DeviceRole, FileMetadata,
+    FolderId, FolderSubscription, SharedFolder,
 };
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +29,12 @@ pub struct MaterializedState {
     pub file_versions: BTreeMap<(FolderId, String), Vec<(BlobHash, u64)>>,
     /// Active access grants.
     pub grants: Vec<AccessGrant>,
+    /// Active file conflicts.
+    #[serde(default)]
+    pub conflicts: Vec<ConflictInfo>,
+    /// Tracks which DAG entry hash last modified each file (for conflict detection).
+    #[serde(default)]
+    pub file_entry_hashes: BTreeMap<(FolderId, String), [u8; 32]>,
 }
 
 impl MaterializedState {
@@ -108,6 +114,9 @@ impl MaterializedState {
                 // Remove all files in this folder.
                 self.files.retain(|(fid, _), _| *fid != *folder_id);
                 self.file_versions.retain(|(fid, _), _| *fid != *folder_id);
+                self.file_entry_hashes
+                    .retain(|(fid, _), _| *fid != *folder_id);
+                self.conflicts.retain(|c| c.folder_id != *folder_id);
             }
             Action::FolderSubscribed {
                 folder_id,
@@ -132,6 +141,7 @@ impl MaterializedState {
             Action::FileAdded { metadata } => {
                 let key = (metadata.folder_id, metadata.path.clone());
                 self.files.insert(key.clone(), metadata.clone());
+                self.file_entry_hashes.insert(key.clone(), entry.hash);
                 // Add to version history.
                 self.file_versions
                     .entry(key)
@@ -147,6 +157,7 @@ impl MaterializedState {
             } => {
                 let key = (*folder_id, path.clone());
                 self.files.insert(key.clone(), metadata.clone());
+                self.file_entry_hashes.insert(key.clone(), entry.hash);
                 // Append to version history.
                 self.file_versions
                     .entry(key)
@@ -156,6 +167,24 @@ impl MaterializedState {
             Action::FileDeleted { folder_id, path } => {
                 let key = (*folder_id, path.clone());
                 self.files.remove(&key);
+                self.file_entry_hashes.remove(&key);
+            }
+            Action::ConflictResolved {
+                folder_id,
+                path,
+                chosen_hash,
+                ..
+            } => {
+                // Remove the conflict for this file.
+                self.conflicts
+                    .retain(|c| !(c.folder_id == *folder_id && c.path == *path));
+                let key = (*folder_id, path.clone());
+                // A zeroed hash signals "resolved in favour of delete".
+                if chosen_hash.as_bytes() == &[0u8; 32] {
+                    self.files.remove(&key);
+                } else if let Some(meta) = self.files.get_mut(&key) {
+                    meta.blob_hash = *chosen_hash;
+                }
             }
             Action::AccessGranted { grant } => {
                 // Remove any existing grant to the same device first.

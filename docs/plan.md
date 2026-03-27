@@ -16,7 +16,7 @@ For a feature overview, see [features.md](features.md).
 | 11 — Daemon + CLI Split                | ✅ Complete (murmur-ipc, murmur-cli, murmurd refactor, gossip networking, FFI networking)             |
 | 12 — Hardening                         | ✅ Complete (networking foundations, security, performance, observability, reliability)                |
 | 13 — Folder Model & File Versioning    | ✅ Complete (types, DAG state, engine methods, auto-folder in murmurd, all tests pass)                |
-| 14 — Conflict Detection & Resolution   | 🔲 Planned                                                                                           |
+| 14 — Conflict Detection & Resolution   | ✅ Complete (types, DAG ancestry check, conflict detection/resolution, engine methods, all tests pass) |
 | 15 — Streaming Blob Storage & Transfer | 🔲 Planned                                                                                           |
 | 16 — Filesystem Watching & Ignore      | 🔲 Planned                                                                                           |
 | 17 — IPC & CLI Expansion               | 🔲 Planned                                                                                           |
@@ -236,28 +236,28 @@ When a conflict is detected, the non-chosen versions are renamed on disk:
 
 **Tasks**:
 
-- [ ] Add `ConflictInfo`, `ConflictVersion` types to `murmur-types`
-- [ ] Add `ConflictResolved` action variant
-- [ ] Implement `is_ancestor(a, b) → bool` in `murmur-dag` (BFS/DFS through parent chain)
-- [ ] Implement conflict detection during state materialization
-- [ ] Add `conflicts` field to `MaterializedState`
-- [ ] Add engine methods: `list_conflicts`, `list_conflicts_in_folder`, `resolve_conflict`
-- [ ] Add `ConflictDetected` variant to `EngineEvent`
-- [ ] Emit `ConflictDetected` event via callbacks when conflict is first detected
+- [x] Add `ConflictInfo`, `ConflictVersion` types to `murmur-types`
+- [x] Add `ConflictResolved` action variant
+- [x] Implement `is_ancestor(a, b) → bool` in `murmur-dag` (BFS/DFS through parent chain)
+- [x] Implement conflict detection during state materialization
+- [x] Add `conflicts` field to `MaterializedState`
+- [x] Add engine methods: `list_conflicts`, `list_conflicts_in_folder`, `resolve_conflict`
+- [x] Add `ConflictDetected` variant to `EngineEvent`
+- [x] Emit `ConflictDetected` event via callbacks when conflict is first detected
 
 **Tests** (≥10):
 
-- [ ] Two devices add file with same `(folder_id, path)` concurrently → conflict detected
-- [ ] Two devices modify same file concurrently → conflict detected
-- [ ] Sequential modifications (causal chain) → no conflict
-- [ ] Resolve conflict → removed from `list_conflicts()`
-- [ ] Resolve conflict → creates correct `ConflictResolved` DAG entry
-- [ ] Resolve conflict → `folder_files()` shows the chosen version
-- [ ] Multiple conflicts on different files tracked independently
-- [ ] Conflict with >2 versions (3 devices edit concurrently) → all versions captured
-- [ ] `ConflictDetected` event emitted via callbacks
-- [ ] Delete vs modify on same file concurrently → conflict detected
-- [ ] Resolving already-resolved conflict → error
+- [x] Two devices add file with same `(folder_id, path)` concurrently → conflict detected
+- [x] Two devices modify same file concurrently → conflict detected
+- [x] Sequential modifications (causal chain) → no conflict
+- [x] Resolve conflict → removed from `list_conflicts()`
+- [x] Resolve conflict → creates correct `ConflictResolved` DAG entry
+- [x] Resolve conflict → `folder_files()` shows the chosen version
+- [x] Multiple conflicts on different files tracked independently
+- [x] Conflict with >2 versions (3 devices edit concurrently) → all versions captured
+- [x] `ConflictDetected` event emitted via callbacks
+- [x] Delete vs modify on same file concurrently → conflict detected
+- [x] Resolving already-resolved conflict → error
 
 ---
 

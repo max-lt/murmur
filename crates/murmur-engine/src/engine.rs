@@ -5,8 +5,8 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use murmur_dag::{Dag, DagEntry};
 use murmur_types::{
-    AccessGrant, Action, BlobHash, DeviceId, DeviceInfo, DeviceRole, FileMetadata, FolderId,
-    FolderSubscription, SharedFolder, SyncMode,
+    AccessGrant, Action, BlobHash, ConflictInfo, ConflictVersion, DeviceId, DeviceInfo, DeviceRole,
+    FileMetadata, FolderId, FolderSubscription, SharedFolder, SyncMode,
 };
 use tracing::{debug, info};
 
@@ -104,6 +104,112 @@ impl MurmurEngine {
         let entry = DagEntry::from_bytes(bytes)?;
         self.dag.load_entry(entry)?;
         Ok(())
+    }
+
+    /// Re-detect all conflicts after loading entries (e.g., on startup).
+    ///
+    /// Must be called after all entries have been loaded via [`load_entry`] or
+    /// [`load_entry_bytes`]. During loading, conflicts are not detected because
+    /// parent entries may not yet be available for ancestry checks.
+    ///
+    /// Also restores correct file metadata for previously resolved conflicts.
+    pub fn rebuild_conflicts(&mut self) {
+        self.dag.state_mut().conflicts.clear();
+
+        // Collect all unique file keys that have mutations.
+        let all_entries = self.dag.all_entries();
+        let mut file_keys: std::collections::BTreeSet<(FolderId, String)> =
+            std::collections::BTreeSet::new();
+        for e in &all_entries {
+            match &e.action {
+                Action::FileAdded { metadata } => {
+                    file_keys.insert((metadata.folder_id, metadata.path.clone()));
+                }
+                Action::FileModified {
+                    folder_id, path, ..
+                } => {
+                    file_keys.insert((*folder_id, path.clone()));
+                }
+                Action::FileDeleted { folder_id, path } => {
+                    file_keys.insert((*folder_id, path.clone()));
+                }
+                _ => {}
+            }
+        }
+
+        // For each file, check for unresolved concurrent mutations.
+        for key in &file_keys {
+            let file_entries = self.find_file_mutation_entries(key);
+            if file_entries.len() < 2 {
+                continue;
+            }
+
+            let mut versions = Vec::new();
+            for fe in &file_entries {
+                let is_ancestor_of_any = file_entries.iter().any(|other| {
+                    other.hash != fe.hash && self.dag.is_ancestor(&fe.hash, &other.hash)
+                });
+                if !is_ancestor_of_any
+                    && let Some(version) = self.entry_to_conflict_version(fe)
+                    && !versions
+                        .iter()
+                        .any(|v: &ConflictVersion| v.dag_entry_hash == fe.hash)
+                {
+                    versions.push(version);
+                }
+            }
+
+            if versions.len() >= 2 {
+                let hlc = versions.iter().map(|v| v.hlc).max().unwrap_or(0);
+                let conflict = ConflictInfo {
+                    folder_id: key.0,
+                    path: key.1.clone(),
+                    versions,
+                    detected_at: hlc,
+                };
+                self.dag.state_mut().conflicts.push(conflict);
+            }
+        }
+
+        // Fix metadata for ConflictResolved entries whose apply() only set blob_hash.
+        for entry in &all_entries {
+            if let Action::ConflictResolved {
+                folder_id,
+                path,
+                chosen_hash,
+                ..
+            } = &entry.action
+            {
+                // Find the original DAG entry for the chosen version.
+                let chosen_entry = all_entries.iter().find(|e| match &e.action {
+                    Action::FileAdded { metadata } => {
+                        metadata.blob_hash == *chosen_hash
+                            && metadata.folder_id == *folder_id
+                            && metadata.path == *path
+                    }
+                    Action::FileModified {
+                        metadata,
+                        folder_id: fid,
+                        path: p,
+                        ..
+                    } => metadata.blob_hash == *chosen_hash && fid == folder_id && p == path,
+                    _ => false,
+                });
+
+                let key = (*folder_id, path.clone());
+                if let Some(orig) = chosen_entry {
+                    match &orig.action {
+                        Action::FileAdded { metadata } | Action::FileModified { metadata, .. } => {
+                            self.dag.state_mut().files.insert(key, metadata.clone());
+                        }
+                        _ => {}
+                    }
+                } else if chosen_hash.as_bytes() == &[0u8; 32] {
+                    // Resolved in favour of delete.
+                    self.dag.state_mut().files.remove(&key);
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------
@@ -296,6 +402,312 @@ impl MurmurEngine {
     }
 
     // -----------------------------------------------------------------
+    // Conflict detection & resolution
+    // -----------------------------------------------------------------
+
+    /// List all active conflicts across all folders.
+    pub fn list_conflicts(&self) -> Vec<ConflictInfo> {
+        self.dag.state().conflicts.clone()
+    }
+
+    /// List active conflicts in a specific folder.
+    pub fn list_conflicts_in_folder(&self, folder_id: FolderId) -> Vec<ConflictInfo> {
+        self.dag
+            .state()
+            .conflicts
+            .iter()
+            .filter(|c| c.folder_id == folder_id)
+            .cloned()
+            .collect()
+    }
+
+    /// Resolve a conflict by choosing one version.
+    ///
+    /// Creates a `ConflictResolved` DAG entry and removes the conflict from
+    /// the active conflicts list. The chosen hash becomes the current version
+    /// with its original full metadata restored.
+    pub fn resolve_conflict(
+        &mut self,
+        folder_id: FolderId,
+        path: &str,
+        chosen_hash: BlobHash,
+    ) -> Result<DagEntry, EngineError> {
+        // Extract data from the conflict before mutating state.
+        let (chosen_entry_hash, discarded_hashes) = {
+            let conflict = self
+                .dag
+                .state()
+                .conflicts
+                .iter()
+                .find(|c| c.folder_id == folder_id && c.path == path)
+                .ok_or_else(|| EngineError::ConflictNotFound(path.to_string()))?;
+
+            if !conflict.versions.iter().any(|v| v.blob_hash == chosen_hash) {
+                return Err(EngineError::ConflictNotFound(format!(
+                    "chosen hash {} not in conflict versions",
+                    chosen_hash
+                )));
+            }
+
+            let chosen_entry_hash = conflict
+                .versions
+                .iter()
+                .find(|v| v.blob_hash == chosen_hash)
+                .map(|v| v.dag_entry_hash);
+
+            let discarded: Vec<BlobHash> = conflict
+                .versions
+                .iter()
+                .filter(|v| v.blob_hash != chosen_hash)
+                .map(|v| v.blob_hash)
+                .collect();
+
+            (chosen_entry_hash, discarded)
+        };
+
+        let entry = self.dag.append(Action::ConflictResolved {
+            folder_id,
+            path: path.to_string(),
+            chosen_hash,
+            discarded_hashes,
+        });
+        self.callbacks.on_dag_entry(entry.to_bytes());
+
+        // Restore full metadata from the chosen version's original DAG entry.
+        // apply() only sets blob_hash; this corrects size, device_origin, etc.
+        self.restore_file_metadata(folder_id, path, chosen_entry_hash);
+
+        info!(%folder_id, path, %chosen_hash, "engine: conflict resolved");
+        Ok(entry)
+    }
+
+    /// Restore full file metadata from a DAG entry after conflict resolution.
+    ///
+    /// `apply()` only updates `blob_hash` in the chosen file's metadata.
+    /// This method looks up the original DAG entry to restore all fields
+    /// (size, device_origin, modified_at, etc.). For deletes, it removes
+    /// the file entirely.
+    fn restore_file_metadata(
+        &mut self,
+        folder_id: FolderId,
+        path: &str,
+        chosen_entry_hash: Option<[u8; 32]>,
+    ) {
+        let Some(entry_hash) = chosen_entry_hash else {
+            return;
+        };
+        let Some(chosen_entry) = self.dag.get_entry(&entry_hash).cloned() else {
+            return;
+        };
+        let key = (folder_id, path.to_string());
+        match &chosen_entry.action {
+            Action::FileAdded { metadata } | Action::FileModified { metadata, .. } => {
+                self.dag.state_mut().files.insert(key, metadata.clone());
+            }
+            Action::FileDeleted { .. } => {
+                self.dag.state_mut().files.remove(&key);
+            }
+            _ => {}
+        }
+    }
+
+    /// Check a DAG entry for conflicts and record them if detected.
+    ///
+    /// Called after applying an entry to the DAG. If the entry is a file
+    /// mutation and a previous entry for the same file is not an ancestor
+    /// of this entry, a conflict is detected.
+    fn detect_conflicts(&mut self, entry: &DagEntry) {
+        let file_key = match &entry.action {
+            Action::FileAdded { metadata } => Some((metadata.folder_id, metadata.path.clone())),
+            Action::FileModified {
+                folder_id, path, ..
+            } => Some((*folder_id, path.clone())),
+            Action::FileDeleted {
+                folder_id, path, ..
+            } => Some((*folder_id, path.clone())),
+            _ => None,
+        };
+
+        let Some(key) = file_key else { return };
+
+        // Check if there's already a conflict for this file — if so, check
+        // whether this new entry adds another concurrent version.
+        let existing_conflict = self
+            .dag
+            .state()
+            .conflicts
+            .iter()
+            .any(|c| c.folder_id == key.0 && c.path == key.1);
+        if existing_conflict {
+            // Update existing conflict with new version if concurrent.
+            self.update_existing_conflict(entry, &key);
+            return;
+        }
+
+        // Get the previous entry hash for this file (before this entry was applied).
+        // Since the entry was just applied, `file_entry_hashes` now points to
+        // `entry.hash`. We need to check if any sibling entry (concurrent) also
+        // modified this file.
+        //
+        // Strategy: look at all entries in the DAG that modify this file.
+        // If any two are concurrent (neither is ancestor of the other), conflict.
+        let file_entries = self.find_file_mutation_entries(&key);
+        if file_entries.len() < 2 {
+            return;
+        }
+
+        // Check the latest two entries. If the second-to-last is not an ancestor
+        // of the last, they're concurrent → conflict.
+        let last = &file_entries[file_entries.len() - 1];
+        let prev = &file_entries[file_entries.len() - 2];
+
+        if !self.dag.is_ancestor(&prev.hash, &last.hash) {
+            // Concurrent modification detected!
+            let mut versions = Vec::new();
+            // Collect all concurrent versions (not just the last two).
+            for fe in &file_entries {
+                let is_ancestor_of_any_other = file_entries.iter().any(|other| {
+                    other.hash != fe.hash && self.dag.is_ancestor(&fe.hash, &other.hash)
+                });
+                if !is_ancestor_of_any_other
+                    && let Some(version) = self.entry_to_conflict_version(fe)
+                    && !versions
+                        .iter()
+                        .any(|v: &ConflictVersion| v.dag_entry_hash == fe.hash)
+                {
+                    versions.push(version);
+                }
+            }
+
+            if versions.len() >= 2 {
+                let conflict = ConflictInfo {
+                    folder_id: key.0,
+                    path: key.1.clone(),
+                    versions: versions.clone(),
+                    detected_at: entry.hlc,
+                };
+
+                // Add to state (we need mutable access to state through the dag).
+                // Since MaterializedState is inside Dag and we can't get &mut to it
+                // directly, we store conflicts via a method.
+                self.push_conflict(conflict.clone());
+
+                self.callbacks.on_event(EngineEvent::ConflictDetected {
+                    folder_id: key.0,
+                    path: key.1,
+                    versions,
+                });
+            }
+        }
+    }
+
+    /// Find all DAG entries that mutate or resolve a specific file, in HLC order.
+    ///
+    /// Includes `ConflictResolved` entries so that ancestry checks correctly
+    /// recognise resolved conflicts as causal descendants of the conflicting
+    /// entries, preventing re-detection after restart.
+    fn find_file_mutation_entries(&self, key: &(FolderId, String)) -> Vec<DagEntry> {
+        let mut entries: Vec<DagEntry> = self
+            .dag
+            .all_entries()
+            .into_iter()
+            .filter(|e| match &e.action {
+                Action::FileAdded { metadata } => {
+                    metadata.folder_id == key.0 && metadata.path == key.1
+                }
+                Action::FileModified {
+                    folder_id, path, ..
+                } => *folder_id == key.0 && *path == key.1,
+                Action::FileDeleted {
+                    folder_id, path, ..
+                } => *folder_id == key.0 && *path == key.1,
+                Action::ConflictResolved {
+                    folder_id, path, ..
+                } => *folder_id == key.0 && *path == key.1,
+                _ => false,
+            })
+            .collect();
+        // Sort by HLC for consistent ordering.
+        entries.sort_by_key(|e| e.hlc);
+        entries
+    }
+
+    /// Convert a DAG entry to a ConflictVersion (if it's a file mutation).
+    fn entry_to_conflict_version(&self, entry: &DagEntry) -> Option<ConflictVersion> {
+        match &entry.action {
+            Action::FileAdded { metadata } => Some(ConflictVersion {
+                blob_hash: metadata.blob_hash,
+                device_id: entry.device_id,
+                hlc: entry.hlc,
+                dag_entry_hash: entry.hash,
+            }),
+            Action::FileModified { metadata, .. } => Some(ConflictVersion {
+                blob_hash: metadata.blob_hash,
+                device_id: entry.device_id,
+                hlc: entry.hlc,
+                dag_entry_hash: entry.hash,
+            }),
+            Action::FileDeleted { .. } => Some(ConflictVersion {
+                blob_hash: BlobHash::from_bytes([0u8; 32]),
+                device_id: entry.device_id,
+                hlc: entry.hlc,
+                dag_entry_hash: entry.hash,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Update an existing conflict with a new concurrent version.
+    fn update_existing_conflict(&mut self, entry: &DagEntry, key: &(FolderId, String)) {
+        if let Some(version) = self.entry_to_conflict_version(entry) {
+            // Check it's actually concurrent with existing versions.
+            let dominated = self
+                .dag
+                .state()
+                .conflicts
+                .iter()
+                .find(|c| c.folder_id == key.0 && c.path == key.1)
+                .map(|c| {
+                    c.versions
+                        .iter()
+                        .any(|v| self.dag.is_ancestor(&entry.hash, &v.dag_entry_hash))
+                })
+                .unwrap_or(false);
+
+            if !dominated {
+                self.push_conflict_version(key, version);
+            }
+        }
+    }
+
+    /// Push a new conflict into the materialized state.
+    fn push_conflict(&mut self, conflict: ConflictInfo) {
+        // Remove any existing conflict for same file first.
+        self.dag
+            .state_mut()
+            .conflicts
+            .retain(|c| !(c.folder_id == conflict.folder_id && c.path == conflict.path));
+        self.dag.state_mut().conflicts.push(conflict);
+    }
+
+    /// Add a version to an existing conflict.
+    fn push_conflict_version(&mut self, key: &(FolderId, String), version: ConflictVersion) {
+        if let Some(c) = self
+            .dag
+            .state_mut()
+            .conflicts
+            .iter_mut()
+            .find(|c| c.folder_id == key.0 && c.path == key.1)
+            && !c
+                .versions
+                .iter()
+                .any(|v| v.dag_entry_hash == version.dag_entry_hash)
+        {
+            c.versions.push(version);
+        }
+    }
+
+    // -----------------------------------------------------------------
     // File management
     // -----------------------------------------------------------------
 
@@ -406,6 +818,36 @@ impl MurmurEngine {
         Ok(entry)
     }
 
+    /// Delete a file from a folder.
+    pub fn delete_file(
+        &mut self,
+        folder_id: FolderId,
+        path: &str,
+    ) -> Result<DagEntry, EngineError> {
+        // Check folder exists.
+        if !self.dag.state().folders.contains_key(&folder_id) {
+            return Err(EngineError::FolderNotFound(folder_id.to_string()));
+        }
+
+        // Check write permission.
+        self.check_write_permission(folder_id)?;
+
+        // Check file exists.
+        let key = (folder_id, path.to_string());
+        if !self.dag.state().files.contains_key(&key) {
+            return Err(EngineError::FileNotFound(path.to_string()));
+        }
+
+        let entry = self.dag.append(Action::FileDeleted {
+            folder_id,
+            path: path.to_string(),
+        });
+        self.callbacks.on_dag_entry(entry.to_bytes());
+
+        debug!(%folder_id, path, "engine: file deleted");
+        Ok(entry)
+    }
+
     /// Check that this device has write permission to a folder.
     fn check_write_permission(&self, folder_id: FolderId) -> Result<(), EngineError> {
         let device_id = self.dag.device_id();
@@ -463,6 +905,10 @@ impl MurmurEngine {
 
         // Emit events based on the action.
         self.emit_action_event(&entry);
+
+        // Check for conflicts after applying.
+        self.detect_conflicts(&entry);
+
         Ok(entry)
     }
 
@@ -475,6 +921,11 @@ impl MurmurEngine {
         for entry in &new_entries {
             self.callbacks.on_dag_entry(entry.to_bytes());
             self.emit_action_event(entry);
+        }
+
+        // Check for conflicts after all entries are applied.
+        for entry in &new_entries {
+            self.detect_conflicts(entry);
         }
 
         if !new_entries.is_empty() {
@@ -1426,5 +1877,659 @@ mod tests {
         let cb = Arc::new(TestCallbacks::default());
         let engine = MurmurEngine::create_network(id, sk, "NAS".to_string(), DeviceRole::Full, cb);
         assert_eq!(engine.device_id(), id);
+    }
+
+    // --- Conflict detection & resolution (Milestone 14) ---
+
+    /// Helper: set up two engines with a shared folder, engine2 approved and subscribed.
+    fn make_two_engines_with_folder() -> (
+        MurmurEngine,
+        Arc<TestCallbacks>,
+        MurmurEngine,
+        Arc<TestCallbacks>,
+        FolderId,
+    ) {
+        let (mut engine1, cb1, folder_id) = make_engine_with_folder("NAS");
+        let (id2, sk2) = make_keypair();
+        let cb2 = Arc::new(TestCallbacks::default());
+
+        engine1.approve_device(id2, DeviceRole::Source).unwrap();
+
+        let mut engine2 = MurmurEngine::from_dag(Dag::new(id2, sk2), cb2.clone());
+        engine2.receive_sync_entries(engine1.all_entries()).unwrap();
+        engine2
+            .subscribe_folder(folder_id, SyncMode::ReadWrite)
+            .unwrap();
+
+        (engine1, cb1, engine2, cb2, folder_id)
+    }
+
+    /// Helper: make file metadata with a specific path.
+    fn make_file_data_path(
+        content: &[u8],
+        folder_id: FolderId,
+        path: &str,
+        device_id: DeviceId,
+    ) -> (FileMetadata, Vec<u8>) {
+        let data = content.to_vec();
+        let hash = BlobHash::from_data(&data);
+        let meta = FileMetadata {
+            blob_hash: hash,
+            folder_id,
+            path: path.to_string(),
+            size: data.len() as u64,
+            mime_type: None,
+            created_at: 0,
+            modified_at: 0,
+            device_origin: device_id,
+        };
+        (meta, data)
+    }
+
+    #[test]
+    fn test_concurrent_file_add_same_path_creates_conflict() {
+        let (mut engine1, _cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        // Both devices add a file at the same path concurrently (before syncing).
+        let (meta1, data1) =
+            make_file_data_path(b"version A", folder_id, "doc.txt", engine1.device_id());
+        engine1.add_file(meta1, data1).unwrap();
+
+        let (meta2, data2) =
+            make_file_data_path(b"version B", folder_id, "doc.txt", engine2.device_id());
+        engine2.add_file(meta2, data2).unwrap();
+
+        // Sync: engine2's entries → engine1.
+        let delta = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta).unwrap();
+
+        // engine1 should detect a conflict.
+        let conflicts = engine1.list_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].folder_id, folder_id);
+        assert_eq!(conflicts[0].path, "doc.txt");
+        assert_eq!(conflicts[0].versions.len(), 2);
+    }
+
+    #[test]
+    fn test_concurrent_file_modify_creates_conflict() {
+        let (mut engine1, _cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        // Add a file on engine1 and sync to engine2.
+        let (meta, data) =
+            make_file_data_path(b"original", folder_id, "shared.txt", engine1.device_id());
+        engine1.add_file(meta, data).unwrap();
+        let delta = engine1.compute_delta(engine2.tips());
+        engine2.receive_sync_entries(delta).unwrap();
+
+        // Both modify the same file concurrently.
+        let (new_meta1, new_data1) = make_file_data_path(
+            b"modified by NAS",
+            folder_id,
+            "shared.txt",
+            engine1.device_id(),
+        );
+        engine1
+            .modify_file(folder_id, "shared.txt", new_meta1, new_data1)
+            .unwrap();
+
+        let (new_meta2, new_data2) = make_file_data_path(
+            b"modified by Phone",
+            folder_id,
+            "shared.txt",
+            engine2.device_id(),
+        );
+        engine2
+            .modify_file(folder_id, "shared.txt", new_meta2, new_data2)
+            .unwrap();
+
+        // Sync engine2 → engine1.
+        let delta = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta).unwrap();
+
+        let conflicts = engine1.list_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "shared.txt");
+        assert_eq!(conflicts[0].versions.len(), 2);
+    }
+
+    #[test]
+    fn test_sequential_modifications_no_conflict() {
+        let (mut engine1, _cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        // Add a file on engine1 and sync to engine2.
+        let (meta, data) =
+            make_file_data_path(b"original", folder_id, "doc.txt", engine1.device_id());
+        engine1.add_file(meta, data).unwrap();
+        let delta = engine1.compute_delta(engine2.tips());
+        engine2.receive_sync_entries(delta).unwrap();
+
+        // Engine1 modifies, syncs to engine2, then engine2 modifies.
+        let (new_meta1, new_data1) =
+            make_file_data_path(b"v2 by NAS", folder_id, "doc.txt", engine1.device_id());
+        engine1
+            .modify_file(folder_id, "doc.txt", new_meta1, new_data1)
+            .unwrap();
+
+        // Sync engine1 → engine2.
+        let delta = engine1.compute_delta(engine2.tips());
+        engine2.receive_sync_entries(delta).unwrap();
+
+        // Now engine2 modifies (this is sequential, not concurrent).
+        let (new_meta2, new_data2) =
+            make_file_data_path(b"v3 by Phone", folder_id, "doc.txt", engine2.device_id());
+        engine2
+            .modify_file(folder_id, "doc.txt", new_meta2, new_data2)
+            .unwrap();
+
+        // Sync engine2 → engine1.
+        let delta = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta).unwrap();
+
+        // No conflict since edits were sequential.
+        assert!(engine1.list_conflicts().is_empty());
+    }
+
+    #[test]
+    fn test_resolve_conflict_removes_from_list() {
+        let (mut engine1, _cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        // Create a conflict.
+        let (meta1, data1) =
+            make_file_data_path(b"version A", folder_id, "doc.txt", engine1.device_id());
+        let hash_a = meta1.blob_hash;
+        engine1.add_file(meta1, data1).unwrap();
+
+        let (meta2, data2) =
+            make_file_data_path(b"version B", folder_id, "doc.txt", engine2.device_id());
+        engine2.add_file(meta2, data2).unwrap();
+
+        let delta = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta).unwrap();
+
+        assert_eq!(engine1.list_conflicts().len(), 1);
+
+        // Resolve choosing version A.
+        engine1
+            .resolve_conflict(folder_id, "doc.txt", hash_a)
+            .unwrap();
+
+        assert!(engine1.list_conflicts().is_empty());
+    }
+
+    #[test]
+    fn test_resolve_conflict_creates_dag_entry() {
+        let (mut engine1, _cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        let (meta1, data1) =
+            make_file_data_path(b"version A", folder_id, "doc.txt", engine1.device_id());
+        let hash_a = meta1.blob_hash;
+        engine1.add_file(meta1, data1).unwrap();
+
+        let (meta2, data2) =
+            make_file_data_path(b"version B", folder_id, "doc.txt", engine2.device_id());
+        let hash_b = meta2.blob_hash;
+        engine2.add_file(meta2, data2).unwrap();
+
+        let delta = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta).unwrap();
+
+        let entry = engine1
+            .resolve_conflict(folder_id, "doc.txt", hash_a)
+            .unwrap();
+
+        match &entry.action {
+            Action::ConflictResolved {
+                folder_id: fid,
+                path,
+                chosen_hash,
+                discarded_hashes,
+            } => {
+                assert_eq!(*fid, folder_id);
+                assert_eq!(path, "doc.txt");
+                assert_eq!(*chosen_hash, hash_a);
+                assert_eq!(discarded_hashes.len(), 1);
+                assert_eq!(discarded_hashes[0], hash_b);
+            }
+            other => panic!("expected ConflictResolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_conflict_updates_folder_files() {
+        let (mut engine1, _cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        let (meta1, data1) =
+            make_file_data_path(b"version A", folder_id, "doc.txt", engine1.device_id());
+        let hash_a = meta1.blob_hash;
+        engine1.add_file(meta1, data1).unwrap();
+
+        let (meta2, data2) =
+            make_file_data_path(b"version B", folder_id, "doc.txt", engine2.device_id());
+        engine2.add_file(meta2, data2).unwrap();
+
+        let delta = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta).unwrap();
+
+        engine1
+            .resolve_conflict(folder_id, "doc.txt", hash_a)
+            .unwrap();
+
+        // The chosen version should be the current file.
+        let file = engine1
+            .state()
+            .files
+            .get(&(folder_id, "doc.txt".to_string()))
+            .expect("file should exist");
+        assert_eq!(file.blob_hash, hash_a);
+    }
+
+    #[test]
+    fn test_multiple_conflicts_independent() {
+        let (mut engine1, _cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        // Create conflicts on two different files.
+        let (meta1a, data1a) =
+            make_file_data_path(b"A doc1", folder_id, "doc1.txt", engine1.device_id());
+        engine1.add_file(meta1a, data1a).unwrap();
+        let (meta1b, data1b) =
+            make_file_data_path(b"A doc2", folder_id, "doc2.txt", engine1.device_id());
+        engine1.add_file(meta1b, data1b).unwrap();
+
+        let (meta2a, data2a) =
+            make_file_data_path(b"B doc1", folder_id, "doc1.txt", engine2.device_id());
+        engine2.add_file(meta2a, data2a).unwrap();
+        let (meta2b, data2b) =
+            make_file_data_path(b"B doc2", folder_id, "doc2.txt", engine2.device_id());
+        engine2.add_file(meta2b, data2b).unwrap();
+
+        let delta = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta).unwrap();
+
+        // Should have 2 independent conflicts.
+        let conflicts = engine1.list_conflicts();
+        assert_eq!(conflicts.len(), 2);
+
+        // Resolving one doesn't affect the other.
+        let hash_doc1 = BlobHash::from_data(b"A doc1");
+        engine1
+            .resolve_conflict(folder_id, "doc1.txt", hash_doc1)
+            .unwrap();
+
+        let conflicts = engine1.list_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "doc2.txt");
+    }
+
+    #[test]
+    fn test_three_way_conflict() {
+        let (mut engine1, _cb1, folder_id) = make_engine_with_folder("NAS");
+        let (id2, sk2) = make_keypair();
+        let (id3, sk3) = make_keypair();
+        let cb2 = Arc::new(TestCallbacks::default());
+        let cb3 = Arc::new(TestCallbacks::default());
+
+        engine1.approve_device(id2, DeviceRole::Source).unwrap();
+        engine1.approve_device(id3, DeviceRole::Source).unwrap();
+
+        let mut engine2 = MurmurEngine::from_dag(Dag::new(id2, sk2), cb2);
+        engine2.receive_sync_entries(engine1.all_entries()).unwrap();
+        engine2
+            .subscribe_folder(folder_id, SyncMode::ReadWrite)
+            .unwrap();
+
+        let mut engine3 = MurmurEngine::from_dag(Dag::new(id3, sk3), cb3);
+        engine3.receive_sync_entries(engine1.all_entries()).unwrap();
+        engine3
+            .subscribe_folder(folder_id, SyncMode::ReadWrite)
+            .unwrap();
+
+        // All three add the same file path concurrently.
+        let (m1, d1) = make_file_data_path(b"v1", folder_id, "doc.txt", engine1.device_id());
+        engine1.add_file(m1, d1).unwrap();
+
+        let (m2, d2) = make_file_data_path(b"v2", folder_id, "doc.txt", engine2.device_id());
+        engine2.add_file(m2, d2).unwrap();
+
+        let (m3, d3) = make_file_data_path(b"v3", folder_id, "doc.txt", engine3.device_id());
+        engine3.add_file(m3, d3).unwrap();
+
+        // Sync all to engine1.
+        let delta2 = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta2).unwrap();
+
+        let delta3 = engine3.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta3).unwrap();
+
+        let conflicts = engine1.list_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        // Should capture all 3 concurrent versions.
+        assert!(conflicts[0].versions.len() >= 3);
+    }
+
+    #[test]
+    fn test_conflict_detected_event_emitted() {
+        let (mut engine1, cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        let (meta1, data1) =
+            make_file_data_path(b"version A", folder_id, "doc.txt", engine1.device_id());
+        engine1.add_file(meta1, data1).unwrap();
+
+        let (meta2, data2) =
+            make_file_data_path(b"version B", folder_id, "doc.txt", engine2.device_id());
+        engine2.add_file(meta2, data2).unwrap();
+
+        let delta = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta).unwrap();
+
+        // Check that a ConflictDetected event was emitted.
+        let events = cb1.events.lock().unwrap();
+        let conflict_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::ConflictDetected { .. }))
+            .collect();
+        assert_eq!(conflict_events.len(), 1);
+
+        match &conflict_events[0] {
+            EngineEvent::ConflictDetected {
+                folder_id: fid,
+                path,
+                versions,
+            } => {
+                assert_eq!(*fid, folder_id);
+                assert_eq!(path, "doc.txt");
+                assert_eq!(versions.len(), 2);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_delete_vs_modify_concurrent_conflict() {
+        let (mut engine1, _cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        // Add a file and sync.
+        let (meta, data) =
+            make_file_data_path(b"original", folder_id, "doc.txt", engine1.device_id());
+        engine1.add_file(meta, data).unwrap();
+        let delta = engine1.compute_delta(engine2.tips());
+        engine2.receive_sync_entries(delta).unwrap();
+
+        // Engine1 modifies the file, engine2 deletes it — concurrently.
+        let (new_meta, new_data) =
+            make_file_data_path(b"updated", folder_id, "doc.txt", engine1.device_id());
+        engine1
+            .modify_file(folder_id, "doc.txt", new_meta, new_data)
+            .unwrap();
+
+        engine2.delete_file(folder_id, "doc.txt").unwrap();
+
+        // Sync engine2 → engine1.
+        let delta = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta).unwrap();
+
+        // Should be a conflict (delete vs modify).
+        let conflicts = engine1.list_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "doc.txt");
+        assert!(conflicts[0].versions.len() >= 2);
+    }
+
+    #[test]
+    fn test_resolve_already_resolved_conflict_error() {
+        let (mut engine1, _cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        let (meta1, data1) =
+            make_file_data_path(b"version A", folder_id, "doc.txt", engine1.device_id());
+        let hash_a = meta1.blob_hash;
+        engine1.add_file(meta1, data1).unwrap();
+
+        let (meta2, data2) =
+            make_file_data_path(b"version B", folder_id, "doc.txt", engine2.device_id());
+        engine2.add_file(meta2, data2).unwrap();
+
+        let delta = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta).unwrap();
+
+        // Resolve the conflict.
+        engine1
+            .resolve_conflict(folder_id, "doc.txt", hash_a)
+            .unwrap();
+
+        // Try to resolve again — should error.
+        let result = engine1.resolve_conflict(folder_id, "doc.txt", hash_a);
+        assert!(matches!(result, Err(EngineError::ConflictNotFound(_))));
+    }
+
+    #[test]
+    fn test_list_conflicts_in_folder() {
+        let (mut engine1, _cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        // Create another folder on engine1.
+        let (folder2, _) = engine1.create_folder("folder2").unwrap();
+        let folder2_id = folder2.folder_id;
+
+        // Sync to engine2 so it knows about folder2.
+        let delta = engine1.compute_delta(engine2.tips());
+        engine2.receive_sync_entries(delta).unwrap();
+        engine2
+            .subscribe_folder(folder2_id, SyncMode::ReadWrite)
+            .unwrap();
+
+        // Create a conflict in folder1.
+        let (m1, d1) = make_file_data_path(b"A", folder_id, "doc.txt", engine1.device_id());
+        engine1.add_file(m1, d1).unwrap();
+        let (m2, d2) = make_file_data_path(b"B", folder_id, "doc.txt", engine2.device_id());
+        engine2.add_file(m2, d2).unwrap();
+
+        // Create a conflict in folder2.
+        let (m3, d3) = make_file_data_path(b"C", folder2_id, "other.txt", engine1.device_id());
+        engine1.add_file(m3, d3).unwrap();
+        let (m4, d4) = make_file_data_path(b"D", folder2_id, "other.txt", engine2.device_id());
+        engine2.add_file(m4, d4).unwrap();
+
+        // Sync both ways.
+        let delta2 = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta2).unwrap();
+
+        // Total conflicts = 2.
+        assert_eq!(engine1.list_conflicts().len(), 2);
+
+        // Filter by folder.
+        assert_eq!(engine1.list_conflicts_in_folder(folder_id).len(), 1);
+        assert_eq!(engine1.list_conflicts_in_folder(folder2_id).len(), 1);
+        assert_eq!(
+            engine1.list_conflicts_in_folder(folder_id)[0].path,
+            "doc.txt"
+        );
+        assert_eq!(
+            engine1.list_conflicts_in_folder(folder2_id)[0].path,
+            "other.txt"
+        );
+    }
+
+    #[test]
+    fn test_same_path_different_folders_no_conflict() {
+        let (mut engine1, _cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        // Create a second folder.
+        let (folder2, _) = engine1.create_folder("folder2").unwrap();
+        let folder2_id = folder2.folder_id;
+        let delta = engine1.compute_delta(engine2.tips());
+        engine2.receive_sync_entries(delta).unwrap();
+        engine2
+            .subscribe_folder(folder2_id, SyncMode::ReadWrite)
+            .unwrap();
+
+        // Engine1 adds doc.txt in folder1, engine2 adds doc.txt in folder2.
+        let (m1, d1) =
+            make_file_data_path(b"folder1 doc", folder_id, "doc.txt", engine1.device_id());
+        engine1.add_file(m1, d1).unwrap();
+
+        let (m2, d2) =
+            make_file_data_path(b"folder2 doc", folder2_id, "doc.txt", engine2.device_id());
+        engine2.add_file(m2, d2).unwrap();
+
+        // Sync.
+        let delta = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta).unwrap();
+
+        // No conflict — different folders.
+        assert!(engine1.list_conflicts().is_empty());
+    }
+
+    #[test]
+    fn test_rebuild_conflicts_restores_on_restart() {
+        let (mut engine1, _cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        // Create a conflict.
+        let (meta1, data1) =
+            make_file_data_path(b"version A", folder_id, "doc.txt", engine1.device_id());
+        engine1.add_file(meta1, data1).unwrap();
+
+        let (meta2, data2) =
+            make_file_data_path(b"version B", folder_id, "doc.txt", engine2.device_id());
+        engine2.add_file(meta2, data2).unwrap();
+
+        let delta = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta).unwrap();
+        assert_eq!(engine1.list_conflicts().len(), 1);
+
+        // Simulate restart: create a new engine from serialised entries.
+        let (id3, sk3) = make_keypair();
+        let cb3 = Arc::new(TestCallbacks::default());
+        let mut engine3 = MurmurEngine::from_dag(Dag::new(id3, sk3), cb3);
+        for entry in engine1.all_entries() {
+            engine3.load_entry(entry).unwrap();
+        }
+
+        // Before rebuild, no conflicts (load_entry doesn't detect them).
+        assert!(engine3.list_conflicts().is_empty());
+
+        // After rebuild, the unresolved conflict reappears.
+        engine3.rebuild_conflicts();
+        assert_eq!(engine3.list_conflicts().len(), 1);
+        assert_eq!(engine3.list_conflicts()[0].path, "doc.txt");
+        assert_eq!(engine3.list_conflicts()[0].versions.len(), 2);
+    }
+
+    #[test]
+    fn test_rebuild_conflicts_skips_resolved() {
+        let (mut engine1, _cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        // Create and resolve a conflict.
+        let (meta1, data1) =
+            make_file_data_path(b"version A", folder_id, "doc.txt", engine1.device_id());
+        let hash_a = meta1.blob_hash;
+        engine1.add_file(meta1, data1).unwrap();
+
+        let (meta2, data2) =
+            make_file_data_path(b"version B", folder_id, "doc.txt", engine2.device_id());
+        engine2.add_file(meta2, data2).unwrap();
+
+        let delta = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta).unwrap();
+        engine1
+            .resolve_conflict(folder_id, "doc.txt", hash_a)
+            .unwrap();
+
+        // Simulate restart.
+        let (id3, sk3) = make_keypair();
+        let cb3 = Arc::new(TestCallbacks::default());
+        let mut engine3 = MurmurEngine::from_dag(Dag::new(id3, sk3), cb3);
+        for entry in engine1.all_entries() {
+            engine3.load_entry(entry).unwrap();
+        }
+        engine3.rebuild_conflicts();
+
+        // Resolved conflict should NOT reappear.
+        assert!(engine3.list_conflicts().is_empty());
+    }
+
+    #[test]
+    fn test_resolve_conflict_restores_full_metadata() {
+        let (mut engine1, _cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        // Two files with DIFFERENT sizes.
+        let content_a = b"short";
+        let content_b = b"this is a much longer version of the file";
+
+        let (meta1, data1) =
+            make_file_data_path(content_a, folder_id, "doc.txt", engine1.device_id());
+        let hash_a = meta1.blob_hash;
+        let size_a = meta1.size;
+        engine1.add_file(meta1, data1).unwrap();
+
+        let (meta2, data2) =
+            make_file_data_path(content_b, folder_id, "doc.txt", engine2.device_id());
+        engine2.add_file(meta2, data2).unwrap();
+
+        let delta = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta).unwrap();
+
+        // Before resolution, state.files has engine2's metadata (last applied).
+        let file_before = engine1
+            .state()
+            .files
+            .get(&(folder_id, "doc.txt".to_string()))
+            .unwrap();
+        assert_ne!(file_before.blob_hash, hash_a, "last-applied overwrote hash");
+
+        // Resolve choosing engine1's version (content_a).
+        engine1
+            .resolve_conflict(folder_id, "doc.txt", hash_a)
+            .unwrap();
+
+        let file = engine1
+            .state()
+            .files
+            .get(&(folder_id, "doc.txt".to_string()))
+            .expect("file should exist");
+        assert_eq!(file.blob_hash, hash_a);
+        assert_eq!(file.size, size_a, "size should match chosen version");
+        assert_eq!(
+            file.device_origin,
+            engine1.device_id(),
+            "device_origin should match chosen version"
+        );
+    }
+
+    #[test]
+    fn test_resolve_delete_vs_modify_in_favour_of_delete() {
+        let (mut engine1, _cb1, mut engine2, _cb2, folder_id) = make_two_engines_with_folder();
+
+        // Add a file and sync.
+        let (meta, data) =
+            make_file_data_path(b"original", folder_id, "doc.txt", engine1.device_id());
+        engine1.add_file(meta, data).unwrap();
+        let delta = engine1.compute_delta(engine2.tips());
+        engine2.receive_sync_entries(delta).unwrap();
+
+        // Engine1 modifies, engine2 deletes — concurrently.
+        let (new_meta, new_data) =
+            make_file_data_path(b"updated", folder_id, "doc.txt", engine1.device_id());
+        engine1
+            .modify_file(folder_id, "doc.txt", new_meta, new_data)
+            .unwrap();
+        engine2.delete_file(folder_id, "doc.txt").unwrap();
+
+        let delta = engine2.compute_delta(engine1.tips());
+        engine1.receive_sync_entries(delta).unwrap();
+
+        // Pick the delete version (zeroed hash).
+        let delete_hash = BlobHash::from_bytes([0u8; 32]);
+        engine1
+            .resolve_conflict(folder_id, "doc.txt", delete_hash)
+            .unwrap();
+
+        // File should be removed from state.
+        assert!(
+            engine1
+                .state()
+                .files
+                .get(&(folder_id, "doc.txt".to_string()))
+                .is_none()
+        );
+        assert!(engine1.list_conflicts().is_empty());
     }
 }

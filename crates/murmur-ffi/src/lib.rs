@@ -162,6 +162,12 @@ pub enum MurmurEventFfi {
         bytes_transferred: u64,
         total_bytes: u64,
     },
+    /// A conflict was detected on a file.
+    ConflictDetected {
+        folder_id: Vec<u8>,
+        path: String,
+        version_count: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +273,15 @@ fn engine_event_to_ffi(event: EngineEvent) -> MurmurEventFfi {
             blob_hash: blob_hash.as_bytes().to_vec(),
             bytes_transferred,
             total_bytes,
+        },
+        EngineEvent::ConflictDetected {
+            folder_id,
+            path,
+            versions,
+        } => MurmurEventFfi::ConflictDetected {
+            folder_id: folder_id.as_bytes().to_vec(),
+            path,
+            version_count: versions.len() as u64,
         },
     }
 }

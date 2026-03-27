@@ -52,4 +52,7 @@ pub enum EngineError {
         /// Actual hash.
         actual: String,
     },
+    /// Conflict not found.
+    #[error("conflict not found: {0}")]
+    ConflictNotFound(String),
 }

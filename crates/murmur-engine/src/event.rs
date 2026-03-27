@@ -1,6 +1,6 @@
 //! Engine events emitted to the platform.
 
-use murmur_types::{BlobHash, DeviceId, DeviceRole, FolderId, SyncMode};
+use murmur_types::{BlobHash, ConflictVersion, DeviceId, DeviceRole, FolderId, SyncMode};
 
 /// Events emitted by the engine to notify the platform of state changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,5 +96,14 @@ pub enum EngineEvent {
         bytes_transferred: u64,
         /// Total blob size.
         total_bytes: u64,
+    },
+    /// A conflict was detected on a file.
+    ConflictDetected {
+        /// The folder containing the conflicted file.
+        folder_id: FolderId,
+        /// The file path within the folder.
+        path: String,
+        /// The competing versions.
+        versions: Vec<ConflictVersion>,
     },
 }

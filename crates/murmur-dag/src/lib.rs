@@ -259,6 +259,13 @@ impl Dag {
         &self.state
     }
 
+    /// Mutable access to the materialized state.
+    ///
+    /// Used by the engine to push conflicts detected during entry processing.
+    pub fn state_mut(&mut self) -> &mut MaterializedState {
+        &mut self.state
+    }
+
     /// Number of entries in the DAG.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -285,6 +292,35 @@ impl Dag {
     /// (e.g. for generating deterministic IDs).
     pub fn clock_tick(&mut self) -> u64 {
         self.clock.tick()
+    }
+
+    /// Check whether entry `a` is an ancestor of entry `b`.
+    ///
+    /// Uses BFS backward from `b` through the parent chain to see if `a` is reachable.
+    /// Returns `false` if either hash is unknown.
+    pub fn is_ancestor(&self, a: &[u8; 32], b: &[u8; 32]) -> bool {
+        if a == b {
+            return true;
+        }
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(*b);
+        while let Some(current) = queue.pop_front() {
+            if current == *a {
+                return true;
+            }
+            if !visited.insert(current) {
+                continue;
+            }
+            if let Some(entry) = self.entries.get(&current) {
+                for parent in &entry.parents {
+                    if !visited.contains(parent) {
+                        queue.push_back(*parent);
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// This device's ID.
@@ -938,6 +974,12 @@ mod tests {
             },
             Action::FolderRemoved {
                 folder_id: FolderId::from_bytes([0xbb; 32]),
+            },
+            Action::ConflictResolved {
+                folder_id: FolderId::from_bytes([0xaa; 32]),
+                path: "photo.jpg".to_string(),
+                chosen_hash: BlobHash::from_data(b"new"),
+                discarded_hashes: vec![BlobHash::from_data(b"old")],
             },
             Action::FolderSubscribed {
                 folder_id: FolderId::from_bytes([0xbb; 32]),

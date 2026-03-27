@@ -156,8 +156,10 @@ fn run_daemon(
                 warn!(error = %e, "skip loading dag entry");
             }
         }
+        engine.rebuild_conflicts();
         info!(
             entries = persisted_entries.len(),
+            conflicts = engine.list_conflicts().len(),
             "loaded persisted DAG entries"
         );
         engine
