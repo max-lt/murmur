@@ -478,9 +478,10 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 .state()
                 .files
                 .iter()
-                .map(|(hash, meta)| FileInfoIpc {
-                    blob_hash: hash.to_string(),
-                    filename: meta.filename.clone(),
+                .map(|((folder_id, _path), meta)| FileInfoIpc {
+                    blob_hash: meta.blob_hash.to_string(),
+                    folder_id: folder_id.to_string(),
+                    path: meta.path.clone(),
                     size: meta.size,
                     mime_type: meta.mime_type.clone(),
                     device_origin: meta.device_origin.to_string(),
@@ -538,15 +539,60 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
             let mime_type = guess_mime(&filename);
 
             let mut eng = ctx.engine.lock().unwrap();
+
+            // Get or create a default folder for the file.
+            let folder_id = {
+                let folders = eng.list_folders();
+                if let Some(f) = folders.first() {
+                    f.folder_id
+                } else {
+                    match eng.create_folder("default") {
+                        Ok((folder, entries)) => {
+                            for entry in &entries {
+                                let _ = ctx.broadcast_tx.send(entry.to_bytes());
+                            }
+                            folder.folder_id
+                        }
+                        Err(e) => {
+                            return CliResponse::Error {
+                                message: format!("create default folder: {e}"),
+                            };
+                        }
+                    }
+                }
+            };
+
+            // Auto-subscribe to the folder if not already subscribed.
+            let device_id = eng.device_id();
+            let already_subscribed = eng
+                .folder_subscriptions(folder_id)
+                .iter()
+                .any(|s| s.device_id == device_id);
+            if !already_subscribed {
+                match eng.subscribe_folder(folder_id, murmur_types::SyncMode::ReadWrite) {
+                    Ok(entry) => {
+                        let _ = ctx.broadcast_tx.send(entry.to_bytes());
+                    }
+                    Err(e) => {
+                        return CliResponse::Error {
+                            message: format!("subscribe to folder: {e}"),
+                        };
+                    }
+                }
+            }
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             let metadata = murmur_types::FileMetadata {
                 blob_hash,
-                filename: filename.clone(),
+                folder_id,
+                path: filename.clone(),
                 size,
                 mime_type: mime_type.clone(),
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
+                created_at: now,
+                modified_at: now,
                 device_origin: eng.device_id(),
             };
             match eng.add_file(metadata, data) {
@@ -911,7 +957,7 @@ mod tests {
         match resp2 {
             CliResponse::Files { files } => {
                 assert_eq!(files.len(), 1);
-                assert_eq!(files[0].filename, "test.txt");
+                assert_eq!(files[0].path, "test.txt");
             }
             other => panic!("expected Files, got {other:?}"),
         }

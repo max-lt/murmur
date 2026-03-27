@@ -93,6 +93,11 @@ define_id!(
     NetworkId
 );
 
+define_id!(
+    /// Unique folder identifier — `blake3(created_at ‖ created_by ‖ name)`.
+    FolderId
+);
+
 // ---------------------------------------------------------------------------
 // Device types
 // ---------------------------------------------------------------------------
@@ -126,6 +131,52 @@ pub struct DeviceInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Folder types
+// ---------------------------------------------------------------------------
+
+/// A shared folder in the network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedFolder {
+    /// Unique folder identifier.
+    pub folder_id: FolderId,
+    /// Human-readable folder name.
+    pub name: String,
+    /// Device that created this folder.
+    pub created_by: DeviceId,
+    /// HLC timestamp of creation.
+    pub created_at: u64,
+}
+
+/// How a device participates in a folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SyncMode {
+    /// Device can read and write files.
+    ReadWrite,
+    /// Device can only read files.
+    ReadOnly,
+}
+
+impl fmt::Display for SyncMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SyncMode::ReadWrite => write!(f, "read-write"),
+            SyncMode::ReadOnly => write!(f, "read-only"),
+        }
+    }
+}
+
+/// A device's subscription to a folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderSubscription {
+    /// Which folder.
+    pub folder_id: FolderId,
+    /// Which device.
+    pub device_id: DeviceId,
+    /// Read-write or read-only.
+    pub mode: SyncMode,
+}
+
+// ---------------------------------------------------------------------------
 // File metadata
 // ---------------------------------------------------------------------------
 
@@ -134,15 +185,19 @@ pub struct DeviceInfo {
 pub struct FileMetadata {
     /// Content hash of the file.
     pub blob_hash: BlobHash,
-    /// Original filename.
-    pub filename: String,
+    /// Which folder this file belongs to.
+    pub folder_id: FolderId,
+    /// Relative path within the folder (e.g. `photos/vacation/img001.jpg`).
+    pub path: String,
     /// File size in bytes.
     pub size: u64,
     /// MIME type (if known).
     pub mime_type: Option<String>,
-    /// Filesystem creation timestamp.
+    /// Filesystem creation timestamp (unix seconds).
     pub created_at: u64,
-    /// Which device created this file.
+    /// Last modification timestamp (unix seconds).
+    pub modified_at: u64,
+    /// Which device created/modified this file.
     pub device_origin: DeviceId,
 }
 
@@ -211,15 +266,56 @@ pub enum Action {
         /// The new name.
         name: String,
     },
-    /// A file has been added.
+    /// A shared folder has been created.
+    FolderCreated {
+        /// The folder's metadata.
+        folder: SharedFolder,
+    },
+    /// A shared folder has been removed from the network.
+    FolderRemoved {
+        /// The removed folder's ID.
+        folder_id: FolderId,
+    },
+    /// A device has subscribed to a folder.
+    FolderSubscribed {
+        /// The folder.
+        folder_id: FolderId,
+        /// The subscribing device.
+        device_id: DeviceId,
+        /// Read-write or read-only.
+        mode: SyncMode,
+    },
+    /// A device has unsubscribed from a folder.
+    FolderUnsubscribed {
+        /// The folder.
+        folder_id: FolderId,
+        /// The unsubscribing device.
+        device_id: DeviceId,
+    },
+    /// A file has been added to a folder.
     FileAdded {
         /// The file's metadata.
         metadata: FileMetadata,
     },
-    /// A file has been deleted.
+    /// A file has been modified (new version).
+    FileModified {
+        /// The folder containing the file.
+        folder_id: FolderId,
+        /// Relative path within the folder.
+        path: String,
+        /// Previous content hash.
+        old_hash: BlobHash,
+        /// New content hash.
+        new_hash: BlobHash,
+        /// Updated file metadata.
+        metadata: FileMetadata,
+    },
+    /// A file has been deleted from a folder.
     FileDeleted {
-        /// The deleted file's hash.
-        blob_hash: BlobHash,
+        /// The folder containing the file.
+        folder_id: FolderId,
+        /// Relative path within the folder.
+        path: String,
     },
     /// Access has been granted.
     AccessGranted {
@@ -248,7 +344,12 @@ impl Action {
             Action::DeviceApproved { .. } => "DeviceApproved",
             Action::DeviceRevoked { .. } => "DeviceRevoked",
             Action::DeviceNameChanged { .. } => "DeviceNameChanged",
+            Action::FolderCreated { .. } => "FolderCreated",
+            Action::FolderRemoved { .. } => "FolderRemoved",
+            Action::FolderSubscribed { .. } => "FolderSubscribed",
+            Action::FolderUnsubscribed { .. } => "FolderUnsubscribed",
             Action::FileAdded { .. } => "FileAdded",
+            Action::FileModified { .. } => "FileModified",
             Action::FileDeleted { .. } => "FileDeleted",
             Action::AccessGranted { .. } => "AccessGranted",
             Action::AccessRevoked { .. } => "AccessRevoked",
@@ -557,10 +658,12 @@ mod tests {
     fn test_file_metadata_roundtrip_postcard() {
         let meta = FileMetadata {
             blob_hash: BlobHash::from_data(b"file content"),
-            filename: "photo.jpg".to_string(),
+            folder_id: FolderId::from_data(b"test-folder"),
+            path: "photos/photo.jpg".to_string(),
             size: 1024,
             mime_type: Some("image/jpeg".to_string()),
             created_at: 1700000000,
+            modified_at: 1700000000,
             device_origin: DeviceId::from_data(b"phone"),
         };
         let encoded = postcard::to_allocvec(&meta).unwrap();
@@ -610,6 +713,7 @@ mod tests {
 
     #[test]
     fn test_action_all_variants_roundtrip() {
+        let folder_id = FolderId::from_data(b"folder1");
         let actions = vec![
             Action::DeviceJoinRequest {
                 device_id: DeviceId::from_data(b"d1"),
@@ -626,18 +730,55 @@ mod tests {
                 device_id: DeviceId::from_data(b"d1"),
                 name: "New Name".to_string(),
             },
+            Action::FolderCreated {
+                folder: SharedFolder {
+                    folder_id,
+                    name: "Photos".to_string(),
+                    created_by: DeviceId::from_data(b"d1"),
+                    created_at: 1000,
+                },
+            },
+            Action::FolderRemoved { folder_id },
+            Action::FolderSubscribed {
+                folder_id,
+                device_id: DeviceId::from_data(b"d1"),
+                mode: SyncMode::ReadWrite,
+            },
+            Action::FolderUnsubscribed {
+                folder_id,
+                device_id: DeviceId::from_data(b"d1"),
+            },
             Action::FileAdded {
                 metadata: FileMetadata {
                     blob_hash: BlobHash::from_data(b"file"),
-                    filename: "test.txt".to_string(),
+                    folder_id,
+                    path: "test.txt".to_string(),
                     size: 100,
                     mime_type: None,
                     created_at: 0,
+                    modified_at: 0,
+                    device_origin: DeviceId::from_data(b"d1"),
+                },
+            },
+            Action::FileModified {
+                folder_id,
+                path: "test.txt".to_string(),
+                old_hash: BlobHash::from_data(b"file"),
+                new_hash: BlobHash::from_data(b"file2"),
+                metadata: FileMetadata {
+                    blob_hash: BlobHash::from_data(b"file2"),
+                    folder_id,
+                    path: "test.txt".to_string(),
+                    size: 200,
+                    mime_type: None,
+                    created_at: 0,
+                    modified_at: 1,
                     device_origin: DeviceId::from_data(b"d1"),
                 },
             },
             Action::FileDeleted {
-                blob_hash: BlobHash::from_data(b"file"),
+                folder_id,
+                path: "test.txt".to_string(),
             },
             Action::AccessGranted {
                 grant: AccessGrant {

@@ -279,6 +279,14 @@ impl Dag {
         self.entries.values().cloned().collect()
     }
 
+    /// Tick the HLC and return the new timestamp.
+    ///
+    /// Useful when the caller needs an HLC value without appending a DAG entry
+    /// (e.g. for generating deterministic IDs).
+    pub fn clock_tick(&mut self) -> u64 {
+        self.clock.tick()
+    }
+
     /// This device's ID.
     pub fn device_id(&self) -> DeviceId {
         self.device_id
@@ -529,10 +537,12 @@ mod tests {
     fn sample_file_metadata(device_id: DeviceId) -> FileMetadata {
         FileMetadata {
             blob_hash: BlobHash::from_data(b"test file content"),
-            filename: "photo.jpg".to_string(),
+            folder_id: FolderId::from_bytes([0xaa; 32]),
+            path: "photo.jpg".to_string(),
             size: 1024,
             mime_type: Some("image/jpeg".to_string()),
             created_at: 1700000000,
+            modified_at: 1700000000,
             device_origin: device_id,
         }
     }
@@ -778,24 +788,30 @@ mod tests {
     fn test_state_add_file() {
         let mut dag = make_dag();
         let meta = sample_file_metadata(dag.device_id());
+        let key = (meta.folder_id, meta.path.clone());
 
         dag.append(Action::FileAdded {
             metadata: meta.clone(),
         });
 
-        assert!(dag.state().files.contains_key(&meta.blob_hash));
+        assert!(dag.state().files.contains_key(&key));
     }
 
     #[test]
     fn test_state_delete_file() {
         let mut dag = make_dag();
         let meta = sample_file_metadata(dag.device_id());
-        let hash = meta.blob_hash;
+        let key = (meta.folder_id, meta.path.clone());
 
-        dag.append(Action::FileAdded { metadata: meta });
-        dag.append(Action::FileDeleted { blob_hash: hash });
+        dag.append(Action::FileAdded {
+            metadata: meta.clone(),
+        });
+        dag.append(Action::FileDeleted {
+            folder_id: meta.folder_id,
+            path: meta.path.clone(),
+        });
 
-        assert!(!dag.state().files.contains_key(&hash));
+        assert!(!dag.state().files.contains_key(&key));
     }
 
     // --- Materialized state: access ---
@@ -890,8 +906,16 @@ mod tests {
             Action::FileAdded {
                 metadata: sample_file_metadata(dag.device_id()),
             },
+            Action::FileModified {
+                folder_id: FolderId::from_bytes([0xaa; 32]),
+                path: "photo.jpg".to_string(),
+                old_hash: BlobHash::from_data(b"old"),
+                new_hash: BlobHash::from_data(b"new"),
+                metadata: sample_file_metadata(dag.device_id()),
+            },
             Action::FileDeleted {
-                blob_hash: BlobHash::from_data(b"x"),
+                folder_id: FolderId::from_bytes([0xaa; 32]),
+                path: "photo.jpg".to_string(),
             },
             Action::AccessGranted {
                 grant: AccessGrant {
@@ -904,6 +928,26 @@ mod tests {
                 },
             },
             Action::AccessRevoked { to: other_id },
+            Action::FolderCreated {
+                folder: SharedFolder {
+                    folder_id: FolderId::from_bytes([0xbb; 32]),
+                    name: "Photos".to_string(),
+                    created_by: dag.device_id(),
+                    created_at: 100,
+                },
+            },
+            Action::FolderRemoved {
+                folder_id: FolderId::from_bytes([0xbb; 32]),
+            },
+            Action::FolderSubscribed {
+                folder_id: FolderId::from_bytes([0xbb; 32]),
+                device_id: dag.device_id(),
+                mode: SyncMode::ReadWrite,
+            },
+            Action::FolderUnsubscribed {
+                folder_id: FolderId::from_bytes([0xbb; 32]),
+                device_id: dag.device_id(),
+            },
             Action::Merge,
             Action::Snapshot {
                 state_hash: [0xfe; 32],
@@ -943,7 +987,8 @@ mod tests {
         fresh.load_entry(e2).unwrap();
 
         assert!(fresh.state().devices.contains_key(&new_id));
-        assert!(fresh.state().files.contains_key(&meta.blob_hash));
+        let key = (meta.folder_id, meta.path.clone());
+        assert!(fresh.state().files.contains_key(&key));
         assert_eq!(fresh.len(), 2);
     }
 
@@ -968,14 +1013,17 @@ mod tests {
         });
 
         // Sync A's history to B so B is known and approved.
+        let folder_id = FolderId::from_bytes([0xaa; 32]);
         dag_b.apply_sync_entries(dag_a.all_entries()).unwrap();
         dag_a.append(Action::FileAdded {
             metadata: FileMetadata {
                 blob_hash: BlobHash::from_data(b"file1"),
-                filename: "a.txt".to_string(),
+                folder_id,
+                path: "a.txt".to_string(),
                 size: 10,
                 mime_type: None,
                 created_at: 0,
+                modified_at: 0,
                 device_origin: id_a,
             },
         });
@@ -984,10 +1032,12 @@ mod tests {
         dag_b.append(Action::FileAdded {
             metadata: FileMetadata {
                 blob_hash: BlobHash::from_data(b"file2"),
-                filename: "b.txt".to_string(),
+                folder_id,
+                path: "b.txt".to_string(),
                 size: 20,
                 mime_type: None,
                 created_at: 0,
+                modified_at: 0,
                 device_origin: id_b,
             },
         });
@@ -1005,25 +1055,25 @@ mod tests {
             dag_a
                 .state()
                 .files
-                .contains_key(&BlobHash::from_data(b"file1"))
+                .contains_key(&(folder_id, "a.txt".to_string()))
         );
         assert!(
             dag_a
                 .state()
                 .files
-                .contains_key(&BlobHash::from_data(b"file2"))
+                .contains_key(&(folder_id, "b.txt".to_string()))
         );
         assert!(
             dag_b
                 .state()
                 .files
-                .contains_key(&BlobHash::from_data(b"file1"))
+                .contains_key(&(folder_id, "a.txt".to_string()))
         );
         assert!(
             dag_b
                 .state()
                 .files
-                .contains_key(&BlobHash::from_data(b"file2"))
+                .contains_key(&(folder_id, "b.txt".to_string()))
         );
 
         // Merge on both to converge tips.
@@ -1461,10 +1511,12 @@ mod tests {
         dag_a.append(Action::FileAdded {
             metadata: FileMetadata {
                 blob_hash: BlobHash::from_data(b"second file"),
-                filename: "doc.pdf".to_string(),
+                folder_id: FolderId::from_bytes([0xaa; 32]),
+                path: "doc.pdf".to_string(),
                 size: 2048,
                 mime_type: Some("application/pdf".to_string()),
                 created_at: 100,
+                modified_at: 100,
                 device_origin: id_a,
             },
         });
@@ -1522,10 +1574,12 @@ mod tests {
         let post_snap_entry = dag_a.append(Action::FileAdded {
             metadata: FileMetadata {
                 blob_hash: BlobHash::from_data(b"post-snapshot file"),
-                filename: "new.txt".to_string(),
+                folder_id: FolderId::from_bytes([0xaa; 32]),
+                path: "new.txt".to_string(),
                 size: 512,
                 mime_type: Some("text/plain".to_string()),
                 created_at: 200,
+                modified_at: 200,
                 device_origin: id_a,
             },
         });

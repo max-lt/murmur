@@ -28,9 +28,15 @@ fn test_three_device_source_backup_tablet() {
     assert_eq!(phone.list_devices().len(), 3);
     assert_eq!(tablet.list_devices().len(), 3);
 
+    // NAS creates a folder, sync to all, everyone subscribes.
+    let folder_id = create_test_folder(&mut nas);
+    sync_engines(&nas, &mut phone);
+    sync_engines(&nas, &mut tablet);
+    subscribe_test_folder(&mut phone, folder_id);
+    subscribe_test_folder(&mut tablet, folder_id);
+
     // Phone adds a file.
-    let (meta, data) = make_file(b"vacation photo", "vacation.jpg", phone_id);
-    let hash = meta.blob_hash;
+    let (meta, data) = make_file(b"vacation photo", "vacation.jpg", phone_id, folder_id);
     phone.add_file(meta, data).unwrap();
 
     // Sync: Phone → NAS → Tablet.
@@ -38,8 +44,17 @@ fn test_three_device_source_backup_tablet() {
     sync_engines(&nas, &mut tablet);
 
     // NAS and Tablet see the file.
-    assert!(nas.state().files.contains_key(&hash));
-    assert!(tablet.state().files.contains_key(&hash));
+    assert!(
+        nas.state()
+            .files
+            .contains_key(&(folder_id, "vacation.jpg".to_string()))
+    );
+    assert!(
+        tablet
+            .state()
+            .files
+            .contains_key(&(folder_id, "vacation.jpg".to_string()))
+    );
 }
 
 /// Three devices, star topology: NAS is hub, Phone and Tablet are spokes.
@@ -54,13 +69,18 @@ fn test_three_device_star_sync() {
     let (mut tablet, _, tablet_id) = join_engine("Tablet");
     join_approve_sync(&mut nas, &mut tablet, tablet_id, DeviceRole::Source);
 
+    // NAS creates a folder, sync to all, everyone subscribes.
+    let folder_id = create_test_folder(&mut nas);
+    sync_engines(&nas, &mut phone);
+    sync_engines(&nas, &mut tablet);
+    subscribe_test_folder(&mut phone, folder_id);
+    subscribe_test_folder(&mut tablet, folder_id);
+
     // Phone and Tablet add files independently.
-    let (meta_phone, data_phone) = make_file(b"phone pic", "phone.jpg", phone_id);
-    let hash_phone = meta_phone.blob_hash;
+    let (meta_phone, data_phone) = make_file(b"phone pic", "phone.jpg", phone_id, folder_id);
     phone.add_file(meta_phone, data_phone).unwrap();
 
-    let (meta_tablet, data_tablet) = make_file(b"tablet doc", "notes.txt", tablet_id);
-    let hash_tablet = meta_tablet.blob_hash;
+    let (meta_tablet, data_tablet) = make_file(b"tablet doc", "notes.txt", tablet_id, folder_id);
     tablet.add_file(meta_tablet, data_tablet).unwrap();
 
     // NAS as hub: collect from both.
@@ -68,19 +88,37 @@ fn test_three_device_star_sync() {
     sync_engines(&tablet, &mut nas);
 
     // NAS has both files.
-    assert!(nas.state().files.contains_key(&hash_phone));
-    assert!(nas.state().files.contains_key(&hash_tablet));
+    assert!(
+        nas.state()
+            .files
+            .contains_key(&(folder_id, "phone.jpg".to_string()))
+    );
+    assert!(
+        nas.state()
+            .files
+            .contains_key(&(folder_id, "notes.txt".to_string()))
+    );
 
     // Distribute from NAS to both.
     sync_engines(&nas, &mut phone);
     sync_engines(&nas, &mut tablet);
 
     // Both have both files.
-    assert!(phone.state().files.contains_key(&hash_tablet));
-    assert!(tablet.state().files.contains_key(&hash_phone));
+    assert!(
+        phone
+            .state()
+            .files
+            .contains_key(&(folder_id, "notes.txt".to_string()))
+    );
+    assert!(
+        tablet
+            .state()
+            .files
+            .contains_key(&(folder_id, "phone.jpg".to_string()))
+    );
 
     // NAS adds its own file.
-    let (meta_nas, data_nas) = make_file(b"nas backup index", "index.json", nas_id);
+    let (meta_nas, data_nas) = make_file(b"nas backup index", "index.json", nas_id, folder_id);
     nas.add_file(meta_nas, data_nas).unwrap();
 
     sync_engines(&nas, &mut phone);

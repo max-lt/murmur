@@ -202,10 +202,7 @@ fn print_plain(response: &CliResponse) {
                 println!("Synced files ({}):", files.len());
                 for f in files {
                     let mime = f.mime_type.as_deref().unwrap_or("unknown");
-                    println!(
-                        "  {} {} ({} bytes, {mime})",
-                        f.blob_hash, f.filename, f.size
-                    );
+                    println!("  {} {} ({} bytes, {mime})", f.blob_hash, f.path, f.size);
                 }
             }
         }

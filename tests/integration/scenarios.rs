@@ -17,12 +17,18 @@ fn test_offline_reconnect() {
     let (mut phone, _, phone_id) = join_engine("Phone");
     join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
 
+    // NAS creates a folder, sync to phone, phone subscribes.
+    let folder_id = create_test_folder(&mut nas);
+    sync_engines(&nas, &mut phone);
+    subscribe_test_folder(&mut phone, folder_id);
+
     // Phone goes "offline" — adds files without syncing.
     for i in 0..5 {
         let (meta, data) = make_file(
             format!("offline photo {i}").as_bytes(),
             &format!("offline_{i}.jpg"),
             phone_id,
+            folder_id,
         );
         phone.add_file(meta, data).unwrap();
     }
@@ -34,6 +40,7 @@ fn test_offline_reconnect() {
             format!("nas file {i}").as_bytes(),
             &format!("nas_{i}.dat"),
             nas_id,
+            folder_id,
         );
         nas.add_file(meta, data).unwrap();
     }
@@ -63,21 +70,26 @@ fn test_multiple_offline_cycles() {
 
     let nas_id = nas.device_id();
 
+    // NAS creates a folder, sync to phone, phone subscribes.
+    let folder_id = create_test_folder(&mut nas);
+    sync_engines(&nas, &mut phone);
+    subscribe_test_folder(&mut phone, folder_id);
+
     // Cycle 1: offline then sync.
-    let (m1, d1) = make_file(b"cycle1-phone", "c1p.txt", phone_id);
+    let (m1, d1) = make_file(b"cycle1-phone", "c1p.txt", phone_id, folder_id);
     phone.add_file(m1, d1).unwrap();
-    let (m2, d2) = make_file(b"cycle1-nas", "c1n.txt", nas_id);
+    let (m2, d2) = make_file(b"cycle1-nas", "c1n.txt", nas_id, folder_id);
     nas.add_file(m2, d2).unwrap();
     bidirectional_sync(&mut nas, &mut phone);
 
     // Cycle 2.
-    let (m3, d3) = make_file(b"cycle2-phone", "c2p.txt", phone_id);
+    let (m3, d3) = make_file(b"cycle2-phone", "c2p.txt", phone_id, folder_id);
     phone.add_file(m3, d3).unwrap();
     bidirectional_sync(&mut nas, &mut phone);
 
     // Cycle 3.
-    let (m4, d4) = make_file(b"cycle3-nas-a", "c3na.txt", nas_id);
-    let (m5, d5) = make_file(b"cycle3-nas-b", "c3nb.txt", nas_id);
+    let (m4, d4) = make_file(b"cycle3-nas-a", "c3na.txt", nas_id, folder_id);
+    let (m5, d5) = make_file(b"cycle3-nas-b", "c3nb.txt", nas_id, folder_id);
     nas.add_file(m4, d4).unwrap();
     nas.add_file(m5, d5).unwrap();
     bidirectional_sync(&mut nas, &mut phone);
@@ -97,9 +109,13 @@ fn test_device_revocation() {
     let (mut phone, _, phone_id) = join_engine("Phone");
     join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
 
+    // NAS creates a folder, sync to phone, phone subscribes.
+    let folder_id = create_test_folder(&mut nas);
+    sync_engines(&nas, &mut phone);
+    subscribe_test_folder(&mut phone, folder_id);
+
     // Phone adds a file.
-    let (meta, data) = make_file(b"pre-revoke photo", "pre.jpg", phone_id);
-    let hash = meta.blob_hash;
+    let (meta, data) = make_file(b"pre-revoke photo", "pre.jpg", phone_id, folder_id);
     phone.add_file(meta, data).unwrap();
     sync_engines(&phone, &mut nas);
 
@@ -114,7 +130,11 @@ fn test_device_revocation() {
     assert!(!phone_info.approved);
 
     // The file added before revocation still exists.
-    assert!(nas.state().files.contains_key(&hash));
+    assert!(
+        nas.state()
+            .files
+            .contains_key(&(folder_id, "pre.jpg".to_string()))
+    );
 }
 
 /// Revoked device's access grants are separate from device revocation.
@@ -214,9 +234,12 @@ fn test_large_file_integrity() {
     let (mut nas, cb_nas) = create_engine("NAS", DeviceRole::Full);
     let nas_id = nas.device_id();
 
+    // NAS creates a folder.
+    let folder_id = create_test_folder(&mut nas);
+
     // Generate a 1MB file.
     let large_data: Vec<u8> = (0u8..=255).cycle().take(1_000_000).collect();
-    let (meta, data) = make_file(&large_data, "large_file.bin", nas_id);
+    let (meta, data) = make_file(&large_data, "large_file.bin", nas_id, folder_id);
     let hash = meta.blob_hash;
 
     nas.add_file(meta, data).unwrap();
@@ -238,14 +261,19 @@ fn test_large_file_bad_hash_rejected() {
     let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
     let nas_id = nas.device_id();
 
+    // NAS creates a folder.
+    let folder_id = create_test_folder(&mut nas);
+
     let data = vec![0u8; 100_000];
     let wrong_hash = murmur_types::BlobHash::from_data(b"wrong content");
     let meta = murmur_types::FileMetadata {
         blob_hash: wrong_hash,
-        filename: "bad.bin".to_string(),
+        folder_id,
+        path: "bad.bin".to_string(),
         size: data.len() as u64,
         mime_type: None,
         created_at: 0,
+        modified_at: 0,
         device_origin: nas_id,
     };
 
@@ -272,15 +300,32 @@ fn test_dag_convergence_after_partition() {
 
     let nas_id = nas.device_id();
 
+    // NAS creates a folder, sync to all, everyone subscribes.
+    let folder_id = create_test_folder(&mut nas);
+    sync_engines(&nas, &mut phone);
+    sync_engines(&nas, &mut tablet);
+    subscribe_test_folder(&mut phone, folder_id);
+    subscribe_test_folder(&mut tablet, folder_id);
+
     // Network partition: Phone and Tablet can't see each other or NAS.
     // Each adds files independently.
-    let (mp, dp) = make_file(b"partition phone file", "part_phone.jpg", phone_id);
+    let (mp, dp) = make_file(
+        b"partition phone file",
+        "part_phone.jpg",
+        phone_id,
+        folder_id,
+    );
     phone.add_file(mp, dp).unwrap();
 
-    let (mt, dt) = make_file(b"partition tablet file", "part_tablet.pdf", tablet_id);
+    let (mt, dt) = make_file(
+        b"partition tablet file",
+        "part_tablet.pdf",
+        tablet_id,
+        folder_id,
+    );
     tablet.add_file(mt, dt).unwrap();
 
-    let (mn, dn) = make_file(b"partition nas file", "part_nas.log", nas_id);
+    let (mn, dn) = make_file(b"partition nas file", "part_nas.log", nas_id, folder_id);
     nas.add_file(mn, dn).unwrap();
 
     // Partition heals: full mesh sync.
@@ -321,12 +366,18 @@ fn test_dag_convergence_many_entries() {
     // A approves B and they sync.
     join_approve_sync(&mut a, &mut b, id_b, DeviceRole::Full);
 
+    // A creates a folder, sync to B, B subscribes.
+    let folder_id = create_test_folder(&mut a);
+    sync_engines(&a, &mut b);
+    subscribe_test_folder(&mut b, folder_id);
+
     // Each adds 10 files independently.
     for i in 0..10 {
         let (meta, data) = make_file(
             format!("a-file-{i}").as_bytes(),
             &format!("a_{i}.txt"),
             id_a,
+            folder_id,
         );
         a.add_file(meta, data).unwrap();
     }
@@ -335,6 +386,7 @@ fn test_dag_convergence_many_entries() {
             format!("b-file-{i}").as_bytes(),
             &format!("b_{i}.txt"),
             id_b,
+            folder_id,
         );
         b.add_file(meta, data).unwrap();
     }
@@ -361,18 +413,23 @@ fn test_file_add_and_sync() {
     let (mut phone, _, phone_id) = join_engine("Phone");
     join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
 
+    // NAS creates a folder, sync to phone, phone subscribes.
+    let folder_id = create_test_folder(&mut nas);
+    sync_engines(&nas, &mut phone);
+    subscribe_test_folder(&mut phone, folder_id);
+
     // Phone adds a file.
-    let (meta, data) = make_file(b"temp file", "temp.txt", phone_id);
-    let hash = meta.blob_hash;
+    let (meta, data) = make_file(b"temp file", "temp.txt", phone_id, folder_id);
     phone.add_file(meta, data).unwrap();
     sync_engines(&phone, &mut nas);
 
     // NAS sees the file.
-    assert!(nas.state().files.contains_key(&hash));
+    let file_key = (folder_id, "temp.txt".to_string());
+    assert!(nas.state().files.contains_key(&file_key));
 
     // Verify file metadata matches.
-    let nas_meta = nas.state().files.get(&hash).unwrap();
-    assert_eq!(nas_meta.filename, "temp.txt");
+    let nas_meta = nas.state().files.get(&file_key).unwrap();
+    assert_eq!(nas_meta.path, "temp.txt");
     assert_eq!(nas_meta.device_origin, phone_id);
 }
 
@@ -386,12 +443,16 @@ fn test_new_device_gets_full_history() {
     let (mut nas, _) = create_engine("NAS", DeviceRole::Full);
     let nas_id = nas.device_id();
 
+    // NAS creates a folder.
+    let folder_id = create_test_folder(&mut nas);
+
     // NAS adds several files over time.
     for i in 0..5 {
         let (meta, data) = make_file(
             format!("history file {i}").as_bytes(),
             &format!("hist_{i}.dat"),
             nas_id,
+            folder_id,
         );
         nas.add_file(meta, data).unwrap();
     }
@@ -446,8 +507,13 @@ fn test_callbacks_triggered_on_sync() {
     let (mut phone, _, phone_id) = join_engine("Phone");
     join_approve_sync(&mut nas, &mut phone, phone_id, DeviceRole::Source);
 
+    // NAS creates a folder, sync to phone, phone subscribes.
+    let folder_id = create_test_folder(&mut nas);
+    sync_engines(&nas, &mut phone);
+    subscribe_test_folder(&mut phone, folder_id);
+
     // Phone adds a file.
-    let (meta, data) = make_file(b"callback test file", "cb.txt", phone_id);
+    let (meta, data) = make_file(b"callback test file", "cb.txt", phone_id, folder_id);
     phone.add_file(meta, data).unwrap();
 
     // Clear NAS callbacks to measure just the sync.

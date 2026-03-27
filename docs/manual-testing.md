@@ -2,7 +2,12 @@
 
 End-to-end manual test for verifying Murmur's core functionality using two daemon
 instances on the same machine. This test covers: network creation, device join/approval,
-file sharing, blob sync, DAG sync, status reporting, and device revocation.
+folder creation, file sharing, blob sync, DAG sync, status reporting, and device revocation.
+
+> **Note (Milestone 13)**: Files now belong to shared folders. The first `add` command
+> auto-creates a "default" folder if none exists. File listing shows paths relative to
+> the folder root. DAG entry counts are higher than pre-M13 due to folder creation and
+> subscription entries.
 
 ## Prerequisites
 
@@ -60,8 +65,8 @@ Listening on socket: /tmp/murmur-a/murmurd.sock
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a status
 ```
 
-**Expected**: shows device name "node-a", role "full", 0 peers, 1 DAG entry (the
-initial `DeviceApproved` for the creator).
+**Expected**: shows device name "node-a", role "full", 0 peers, 2 DAG entries (the
+initial `DeviceJoinRequest` + `DeviceApproved` for the creator).
 
 ```bash
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a devices
@@ -73,7 +78,7 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a devices
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a files
 ```
 
-**Expected**: no files.
+**Expected**: no files (no folders or files created yet).
 
 **Checkpoint 1**: Node A is running, network created, status is healthy.
 
@@ -156,7 +161,9 @@ echo "Hello from Node A — $(date)" > /tmp/test-file-a.txt
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a add /tmp/test-file-a.txt
 ```
 
-**Expected**: "File added" with the blob hash.
+**Expected**: "File added" with the blob hash. On the first `add`, a "default" folder
+is automatically created (you may see extra DAG entries for `FolderCreated` and
+`FolderSubscribed`).
 
 Verify on Node A:
 
@@ -165,6 +172,7 @@ cargo run --bin murmur-cli -- --data-dir /tmp/murmur-a files
 ```
 
 **Expected**: one file — `test-file-a.txt` with size and MIME type `text/plain`.
+The file path is displayed relative to the folder root.
 
 Wait 5-10 seconds for gossip + blob sync, then verify on Node B:
 
@@ -200,6 +208,10 @@ Now test the reverse direction — add a file from Node B:
 echo "Hello from Node B — $(date)" > /tmp/test-file-b.txt
 cargo run --bin murmur-cli -- --data-dir /tmp/murmur-b add /tmp/test-file-b.txt
 ```
+
+> Node B's first `add` also auto-creates a "default" folder if it doesn't already
+> have one synced from Node A. If Node B already synced Node A's folder, the file
+> is added to that existing folder.
 
 Wait 5-10 seconds, then verify on Node A:
 
@@ -404,10 +416,10 @@ rm -rf /tmp/murmur-a /tmp/murmur-b /tmp/test-file-a.txt /tmp/test-file-b.txt /tm
 
 | # | What | Pass criteria |
 |---|------|---------------|
-| 1 | Network creation | Node A running, mnemonic printed, status shows 1 entry |
+| 1 | Network creation | Node A running, mnemonic printed, status shows 2 entries |
 | 2 | Device join | Node B pending on Node A |
 | 3 | Device approval | Both nodes see both devices |
-| 4 | File sync A→B | File added on A appears on B with blob data |
+| 4 | File sync A→B | File added on A appears on B (auto-creates "default" folder) |
 | 5 | File sync B→A | File added on B appears on A |
 | 6 | Large file | 5 MB file syncs with correct hash |
 | 7 | Delta sync | Offline file synced after reconnect |
@@ -533,7 +545,7 @@ Wait 5-10 seconds for gossip + blob sync.
 
 In the desktop app, navigate to the **Files tab**.
 
-**Expected**: `test-daemon-file.txt` appears in the file list with filename, size,
+**Expected**: `test-daemon-file.txt` appears in the file list with path, size,
 and MIME type `text/plain`.
 
 **Checkpoint D4**: File added on CLI daemon synced to desktop app.
@@ -553,7 +565,7 @@ Navigate to the **Files tab** in the desktop app.
 1. Type `/tmp/test-desktop.txt` in the file path input field
 2. Click **"Add File"**
 
-**Expected**: the file appears in the files list with filename, size, and MIME type.
+**Expected**: the file appears in the files list with path, size, and MIME type.
 
 Verify the blob was stored:
 
@@ -841,7 +853,7 @@ Wait 5-10 seconds for gossip + blob sync.
 
 In the Android app, navigate to the **Files tab**.
 
-**Expected**: `test-cli-file.txt` appears in the file list with filename, size, and
+**Expected**: `test-cli-file.txt` appears in the file list with path, size, and
 MIME type `text/plain`.
 
 **Terminal 2** — verify from CLI:

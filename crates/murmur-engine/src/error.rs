@@ -32,4 +32,24 @@ pub enum EngineError {
         /// Actual hash.
         actual: String,
     },
+    /// Folder not found.
+    #[error("folder not found: {0}")]
+    FolderNotFound(String),
+    /// Device not subscribed to folder.
+    #[error("not subscribed to folder: {0}")]
+    NotSubscribed(String),
+    /// Cannot write to a read-only folder.
+    #[error("folder is read-only: {0}")]
+    ReadOnlyFolder(String),
+    /// File not found in folder.
+    #[error("file not found: {0}")]
+    FileNotFound(String),
+    /// Old hash mismatch during file modification.
+    #[error("old hash mismatch: expected {expected}, got {actual}")]
+    OldHashMismatch {
+        /// Expected hash.
+        expected: String,
+        /// Actual hash.
+        actual: String,
+    },
 }

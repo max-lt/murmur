@@ -25,7 +25,7 @@ use murmur_engine::{EngineEvent, MurmurEngine, PlatformCallbacks};
 use murmur_net::topic_from_network_id;
 use murmur_seed::WordCount;
 use murmur_seed::{DeviceKeyPair, NetworkIdentity, generate_mnemonic, parse_mnemonic};
-use murmur_types::{AccessScope, BlobHash, DeviceId, DeviceRole, FileMetadata};
+use murmur_types::{AccessScope, BlobHash, DeviceId, DeviceRole, FileMetadata, FolderId};
 use tracing::{debug, error};
 
 // ---------------------------------------------------------------------------
@@ -88,14 +88,18 @@ pub struct DeviceInfoFfi {
 pub struct FileMetadataFfi {
     /// Raw 32-byte blake3 content hash.
     pub blob_hash: Vec<u8>,
-    /// File name.
-    pub filename: String,
+    /// Raw 32-byte folder ID.
+    pub folder_id: Vec<u8>,
+    /// Relative path within the folder (e.g. `photos/vacation/img001.jpg`).
+    pub path: String,
     /// File size in bytes.
     pub size: u64,
     /// MIME type, if known.
     pub mime_type: Option<String>,
     /// Filesystem creation timestamp (Unix seconds).
     pub created_at: u64,
+    /// Last modification timestamp (Unix seconds).
+    pub modified_at: u64,
     /// Raw 32-byte originating device ID.
     pub device_origin: Vec<u8>,
 }
@@ -120,10 +124,25 @@ pub enum MurmurEventFfi {
     DeviceApproved { device_id: Vec<u8>, role: String },
     /// A device was revoked.
     DeviceRevoked { device_id: Vec<u8> },
+    /// A folder was created.
+    FolderCreated { folder_id: Vec<u8>, name: String },
+    /// A device subscribed to a folder.
+    FolderSubscribed {
+        folder_id: Vec<u8>,
+        device_id: Vec<u8>,
+        mode: String,
+    },
     /// A file was synced.
     FileSynced {
         blob_hash: Vec<u8>,
-        filename: String,
+        folder_id: Vec<u8>,
+        path: String,
+    },
+    /// A file was modified (new version).
+    FileModified {
+        folder_id: Vec<u8>,
+        path: String,
+        new_hash: Vec<u8>,
     },
     /// A blob was received.
     BlobReceived { blob_hash: Vec<u8> },
@@ -191,12 +210,36 @@ fn engine_event_to_ffi(event: EngineEvent) -> MurmurEventFfi {
         EngineEvent::DeviceRevoked { device_id } => MurmurEventFfi::DeviceRevoked {
             device_id: device_id.as_bytes().to_vec(),
         },
+        EngineEvent::FolderCreated { folder_id, name } => MurmurEventFfi::FolderCreated {
+            folder_id: folder_id.as_bytes().to_vec(),
+            name,
+        },
+        EngineEvent::FolderSubscribed {
+            folder_id,
+            device_id,
+            mode,
+        } => MurmurEventFfi::FolderSubscribed {
+            folder_id: folder_id.as_bytes().to_vec(),
+            device_id: device_id.as_bytes().to_vec(),
+            mode: mode.to_string(),
+        },
         EngineEvent::FileSynced {
             blob_hash,
-            filename,
+            folder_id,
+            path,
         } => MurmurEventFfi::FileSynced {
             blob_hash: blob_hash.as_bytes().to_vec(),
-            filename,
+            folder_id: folder_id.as_bytes().to_vec(),
+            path,
+        },
+        EngineEvent::FileModified {
+            folder_id,
+            path,
+            new_hash,
+        } => MurmurEventFfi::FileModified {
+            folder_id: folder_id.as_bytes().to_vec(),
+            path,
+            new_hash: new_hash.as_bytes().to_vec(),
         },
         EngineEvent::BlobReceived { blob_hash } => MurmurEventFfi::BlobReceived {
             blob_hash: blob_hash.as_bytes().to_vec(),
@@ -451,6 +494,13 @@ impl MurmurHandle {
             .map_err(|_| FfiError::OperationFailed {
                 message: "blob_hash must be 32 bytes".to_string(),
             })?;
+        let folder_arr: [u8; 32] =
+            metadata
+                .folder_id
+                .try_into()
+                .map_err(|_| FfiError::OperationFailed {
+                    message: "folder_id must be 32 bytes".to_string(),
+                })?;
         let origin_arr: [u8; 32] =
             metadata
                 .device_origin
@@ -460,10 +510,12 @@ impl MurmurHandle {
                 })?;
         let file_meta = FileMetadata {
             blob_hash: BlobHash::from_bytes(hash_arr),
-            filename: metadata.filename,
+            folder_id: FolderId::from_bytes(folder_arr),
+            path: metadata.path,
             size: metadata.size,
             mime_type: metadata.mime_type,
             created_at: metadata.created_at,
+            modified_at: metadata.modified_at,
             device_origin: DeviceId::from_bytes(origin_arr),
         };
         let entry = self.inner.lock().unwrap().add_file(file_meta, data)?;
@@ -664,12 +716,22 @@ mod tests {
     fn valid_file_meta(handle: &MurmurHandle, content: &[u8]) -> (Vec<u8>, FileMetadataFfi) {
         let blob_hash = BlobHash::from_data(content).as_bytes().to_vec();
         let device_origin = hex::decode(handle.device_id_hex()).unwrap();
+        // Create a real folder in the engine so add_file() can find it.
+        let (folder, _entry) = handle
+            .inner
+            .lock()
+            .unwrap()
+            .create_folder("test-folder")
+            .unwrap();
+        let folder_id = folder.folder_id.as_bytes().to_vec();
         let meta = FileMetadataFfi {
             blob_hash: blob_hash.clone(),
-            filename: "test.txt".to_string(),
+            folder_id,
+            path: "test.txt".to_string(),
             size: content.len() as u64,
             mime_type: None,
             created_at: 0,
+            modified_at: 0,
             device_origin,
         };
         (blob_hash, meta)
@@ -701,19 +763,25 @@ mod tests {
     #[test]
     fn test_file_metadata_ffi_fields() {
         let hash = [0xabu8; 32];
+        let folder = [0x11u8; 32];
         let origin = [0xcdu8; 32];
         let meta = FileMetadataFfi {
             blob_hash: hash.to_vec(),
-            filename: "photo.jpg".to_string(),
+            folder_id: folder.to_vec(),
+            path: "photos/photo.jpg".to_string(),
             size: 1024,
             mime_type: Some("image/jpeg".to_string()),
             created_at: 9999,
+            modified_at: 10000,
             device_origin: origin.to_vec(),
         };
         assert_eq!(meta.blob_hash, hash);
-        assert_eq!(meta.filename, "photo.jpg");
+        assert_eq!(meta.folder_id, folder);
+        assert_eq!(meta.path, "photos/photo.jpg");
         assert_eq!(meta.size, 1024);
         assert_eq!(meta.mime_type.unwrap(), "image/jpeg");
+        assert_eq!(meta.created_at, 9999);
+        assert_eq!(meta.modified_at, 10000);
         assert_eq!(meta.device_origin, origin);
     }
 

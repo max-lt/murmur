@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use murmur_dag::{Dag, DagEntry};
-use murmur_types::{AccessGrant, Action, BlobHash, DeviceId, DeviceInfo, DeviceRole, FileMetadata};
+use murmur_types::{
+    AccessGrant, Action, BlobHash, DeviceId, DeviceInfo, DeviceRole, FileMetadata, FolderId,
+    FolderSubscription, SharedFolder, SyncMode,
+};
 use tracing::{debug, info};
 
 use crate::callbacks::PlatformCallbacks;
@@ -152,13 +155,154 @@ impl MurmurEngine {
     }
 
     // -----------------------------------------------------------------
+    // Folder management
+    // -----------------------------------------------------------------
+
+    /// Create a new shared folder.
+    ///
+    /// The creator is automatically subscribed as ReadWrite.
+    pub fn create_folder(
+        &mut self,
+        name: &str,
+    ) -> Result<(SharedFolder, Vec<DagEntry>), EngineError> {
+        let clock = self.dag.clock_tick();
+        let device_id = self.dag.device_id();
+
+        // Compute a deterministic folder ID.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&clock.to_le_bytes());
+        hasher.update(device_id.as_bytes());
+        hasher.update(name.as_bytes());
+        let folder_id = FolderId::from_bytes(*hasher.finalize().as_bytes());
+
+        let folder = SharedFolder {
+            folder_id,
+            name: name.to_string(),
+            created_by: device_id,
+            created_at: clock,
+        };
+
+        let entry = self.dag.append(Action::FolderCreated {
+            folder: folder.clone(),
+        });
+        self.callbacks.on_dag_entry(entry.to_bytes());
+
+        // Auto-subscribe the creator as ReadWrite.
+        let sub_entry = self.dag.append(Action::FolderSubscribed {
+            folder_id,
+            device_id,
+            mode: SyncMode::ReadWrite,
+        });
+        self.callbacks.on_dag_entry(sub_entry.to_bytes());
+
+        info!(%folder_id, name, "engine: folder created");
+        self.callbacks.on_event(EngineEvent::FolderCreated {
+            folder_id,
+            name: name.to_string(),
+        });
+
+        Ok((folder, vec![entry, sub_entry]))
+    }
+
+    /// Remove a shared folder from the network.
+    pub fn remove_folder(&mut self, folder_id: FolderId) -> Result<DagEntry, EngineError> {
+        if !self.dag.state().folders.contains_key(&folder_id) {
+            return Err(EngineError::FolderNotFound(folder_id.to_string()));
+        }
+
+        let entry = self.dag.append(Action::FolderRemoved { folder_id });
+        self.callbacks.on_dag_entry(entry.to_bytes());
+
+        info!(%folder_id, "engine: folder removed");
+        Ok(entry)
+    }
+
+    /// Subscribe this device to a folder.
+    pub fn subscribe_folder(
+        &mut self,
+        folder_id: FolderId,
+        mode: SyncMode,
+    ) -> Result<DagEntry, EngineError> {
+        if !self.dag.state().folders.contains_key(&folder_id) {
+            return Err(EngineError::FolderNotFound(folder_id.to_string()));
+        }
+
+        let device_id = self.dag.device_id();
+        let entry = self.dag.append(Action::FolderSubscribed {
+            folder_id,
+            device_id,
+            mode,
+        });
+        self.callbacks.on_dag_entry(entry.to_bytes());
+
+        info!(%folder_id, %device_id, %mode, "engine: folder subscribed");
+        self.callbacks.on_event(EngineEvent::FolderSubscribed {
+            folder_id,
+            device_id,
+            mode,
+        });
+
+        Ok(entry)
+    }
+
+    /// Unsubscribe this device from a folder.
+    pub fn unsubscribe_folder(&mut self, folder_id: FolderId) -> Result<DagEntry, EngineError> {
+        let device_id = self.dag.device_id();
+        let entry = self.dag.append(Action::FolderUnsubscribed {
+            folder_id,
+            device_id,
+        });
+        self.callbacks.on_dag_entry(entry.to_bytes());
+
+        info!(%folder_id, %device_id, "engine: folder unsubscribed");
+        Ok(entry)
+    }
+
+    /// List all shared folders.
+    pub fn list_folders(&self) -> Vec<SharedFolder> {
+        self.dag.state().folders.values().cloned().collect()
+    }
+
+    /// Get subscriptions for a folder.
+    pub fn folder_subscriptions(&self, folder_id: FolderId) -> Vec<FolderSubscription> {
+        self.dag
+            .state()
+            .subscriptions
+            .iter()
+            .filter(|((fid, _), _)| *fid == folder_id)
+            .map(|(_, sub)| sub.clone())
+            .collect()
+    }
+
+    /// List files in a folder.
+    pub fn folder_files(&self, folder_id: FolderId) -> Vec<FileMetadata> {
+        self.dag
+            .state()
+            .files
+            .iter()
+            .filter(|((fid, _), _)| *fid == folder_id)
+            .map(|(_, meta)| meta.clone())
+            .collect()
+    }
+
+    /// Get version history for a file.
+    pub fn file_history(&self, folder_id: FolderId, path: &str) -> Vec<(BlobHash, u64)> {
+        self.dag
+            .state()
+            .file_versions
+            .get(&(folder_id, path.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    // -----------------------------------------------------------------
     // File management
     // -----------------------------------------------------------------
 
-    /// Add a file to the network.
+    /// Add a file to a folder.
     ///
-    /// Creates a `FileAdded` DAG entry. The platform provides the blob hash,
-    /// metadata, and data. Returns `Err` if the file already exists (dedup).
+    /// Creates a `FileAdded` DAG entry. Verifies the device is subscribed as
+    /// ReadWrite. Returns `Err` if the file already exists at the same path.
     pub fn add_file(
         &mut self,
         metadata: FileMetadata,
@@ -173,27 +317,105 @@ impl MurmurEngine {
             });
         }
 
-        // Dedup: skip if already in the DAG.
-        if self.dag.state().files.contains_key(&metadata.blob_hash) {
-            return Err(EngineError::FileAlreadyExists(
-                metadata.blob_hash.to_string(),
-            ));
+        // Check folder exists.
+        if !self.dag.state().folders.contains_key(&metadata.folder_id) {
+            return Err(EngineError::FolderNotFound(metadata.folder_id.to_string()));
+        }
+
+        // Check subscription and write permission.
+        self.check_write_permission(metadata.folder_id)?;
+
+        // Dedup: skip if file already exists at this path.
+        let key = (metadata.folder_id, metadata.path.clone());
+        if self.dag.state().files.contains_key(&key) {
+            return Err(EngineError::FileAlreadyExists(metadata.path.clone()));
         }
 
         let blob_hash = metadata.blob_hash;
-        let filename = metadata.filename.clone();
+        let folder_id = metadata.folder_id;
+        let path = metadata.path.clone();
 
         let entry = self.dag.append(Action::FileAdded { metadata });
         self.callbacks.on_dag_entry(entry.to_bytes());
         self.callbacks.on_blob_received(blob_hash, data);
 
-        debug!(%blob_hash, %filename, "engine: file added");
+        debug!(%blob_hash, %path, "engine: file added");
         self.callbacks.on_event(EngineEvent::FileSynced {
             blob_hash,
-            filename,
+            folder_id,
+            path,
         });
 
         Ok(entry)
+    }
+
+    /// Modify an existing file (create a new version).
+    pub fn modify_file(
+        &mut self,
+        folder_id: FolderId,
+        path: &str,
+        new_metadata: FileMetadata,
+        data: Vec<u8>,
+    ) -> Result<DagEntry, EngineError> {
+        // Verify blob integrity.
+        let actual_hash = BlobHash::from_data(&data);
+        if actual_hash != new_metadata.blob_hash {
+            return Err(EngineError::BlobIntegrity {
+                expected: new_metadata.blob_hash.to_string(),
+                actual: actual_hash.to_string(),
+            });
+        }
+
+        // Check folder exists.
+        if !self.dag.state().folders.contains_key(&folder_id) {
+            return Err(EngineError::FolderNotFound(folder_id.to_string()));
+        }
+
+        // Check write permission.
+        self.check_write_permission(folder_id)?;
+
+        // Get the current file.
+        let key = (folder_id, path.to_string());
+        let old_hash = self
+            .dag
+            .state()
+            .files
+            .get(&key)
+            .map(|m| m.blob_hash)
+            .ok_or_else(|| EngineError::FileNotFound(path.to_string()))?;
+
+        let new_hash = new_metadata.blob_hash;
+
+        let entry = self.dag.append(Action::FileModified {
+            folder_id,
+            path: path.to_string(),
+            old_hash,
+            new_hash,
+            metadata: new_metadata,
+        });
+        self.callbacks.on_dag_entry(entry.to_bytes());
+        self.callbacks.on_blob_received(new_hash, data);
+
+        debug!(%new_hash, %path, "engine: file modified");
+        self.callbacks.on_event(EngineEvent::FileModified {
+            folder_id,
+            path: path.to_string(),
+            new_hash,
+        });
+
+        Ok(entry)
+    }
+
+    /// Check that this device has write permission to a folder.
+    fn check_write_permission(&self, folder_id: FolderId) -> Result<(), EngineError> {
+        let device_id = self.dag.device_id();
+        match self.dag.state().subscriptions.get(&(folder_id, device_id)) {
+            Some(sub) if sub.mode == SyncMode::ReadOnly => {
+                Err(EngineError::ReadOnlyFolder(folder_id.to_string()))
+            }
+            Some(_) => Ok(()),
+            None => Err(EngineError::NotSubscribed(folder_id.to_string())),
+        }
     }
 
     // -----------------------------------------------------------------
@@ -334,10 +556,40 @@ impl MurmurEngine {
                     device_id: *device_id,
                 });
             }
+            Action::FolderCreated { folder } => {
+                self.callbacks.on_event(EngineEvent::FolderCreated {
+                    folder_id: folder.folder_id,
+                    name: folder.name.clone(),
+                });
+            }
+            Action::FolderSubscribed {
+                folder_id,
+                device_id,
+                mode,
+            } => {
+                self.callbacks.on_event(EngineEvent::FolderSubscribed {
+                    folder_id: *folder_id,
+                    device_id: *device_id,
+                    mode: *mode,
+                });
+            }
             Action::FileAdded { metadata } => {
                 self.callbacks.on_event(EngineEvent::FileSynced {
                     blob_hash: metadata.blob_hash,
-                    filename: metadata.filename.clone(),
+                    folder_id: metadata.folder_id,
+                    path: metadata.path.clone(),
+                });
+            }
+            Action::FileModified {
+                folder_id,
+                path,
+                new_hash,
+                ..
+            } => {
+                self.callbacks.on_event(EngineEvent::FileModified {
+                    folder_id: *folder_id,
+                    path: path.clone(),
+                    new_hash: *new_hash,
                 });
             }
             Action::AccessGranted { grant } => {
@@ -406,15 +658,24 @@ mod tests {
         (engine, cb)
     }
 
-    fn make_file_data(content: &[u8]) -> (FileMetadata, Vec<u8>) {
+    /// Create a test engine with a folder already set up.
+    fn make_engine_with_folder(name: &str) -> (MurmurEngine, Arc<TestCallbacks>, FolderId) {
+        let (mut engine, cb) = make_engine(name);
+        let (folder, _) = engine.create_folder("test-folder").unwrap();
+        (engine, cb, folder.folder_id)
+    }
+
+    fn make_file_data(content: &[u8], folder_id: FolderId) -> (FileMetadata, Vec<u8>) {
         let data = content.to_vec();
         let hash = BlobHash::from_data(&data);
         let meta = FileMetadata {
             blob_hash: hash,
-            filename: "test.txt".to_string(),
+            folder_id,
+            path: "test.txt".to_string(),
             size: data.len() as u64,
             mime_type: None,
             created_at: 0,
+            modified_at: 0,
             device_origin: DeviceId::from_data(b"origin"),
         };
         (meta, data)
@@ -560,16 +821,105 @@ mod tests {
         assert_eq!(pending.len(), 2);
     }
 
+    // --- Folder management ---
+
+    #[test]
+    fn test_create_folder() {
+        let (mut engine, _cb) = make_engine("NAS");
+        let (folder, _entry) = engine.create_folder("Photos").unwrap();
+
+        assert_eq!(folder.name, "Photos");
+        let folders = engine.list_folders();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].name, "Photos");
+    }
+
+    #[test]
+    fn test_create_folder_auto_subscribes_creator() {
+        let (mut engine, _cb) = make_engine("NAS");
+        let (folder, _) = engine.create_folder("Photos").unwrap();
+
+        let subs = engine.folder_subscriptions(folder.folder_id);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].device_id, engine.device_id());
+        assert_eq!(subs[0].mode, SyncMode::ReadWrite);
+    }
+
+    #[test]
+    fn test_remove_folder() {
+        let (mut engine, _cb) = make_engine("NAS");
+        let (folder, _) = engine.create_folder("Photos").unwrap();
+
+        engine.remove_folder(folder.folder_id).unwrap();
+        assert!(engine.list_folders().is_empty());
+    }
+
+    #[test]
+    fn test_remove_folder_not_found() {
+        let (mut engine, _cb) = make_engine("NAS");
+        let result = engine.remove_folder(FolderId::from_data(b"nonexistent"));
+        assert!(matches!(result, Err(EngineError::FolderNotFound(_))));
+    }
+
+    #[test]
+    fn test_subscribe_folder_read_write() {
+        let (mut engine, _cb) = make_engine("NAS");
+        let (folder, _) = engine.create_folder("Photos").unwrap();
+
+        // Creator is already subscribed; subscribe another device
+        let (new_id, _) = make_keypair();
+        engine.approve_device(new_id, DeviceRole::Full).unwrap();
+
+        // The subscription is for THIS device, so we test the mode is recorded
+        let subs = engine.folder_subscriptions(folder.folder_id);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].mode, SyncMode::ReadWrite);
+    }
+
+    #[test]
+    fn test_subscribe_folder_read_only() {
+        let (mut engine, _cb) = make_engine("NAS");
+        let (folder, _) = engine.create_folder("Photos").unwrap();
+
+        // Unsubscribe and re-subscribe as ReadOnly
+        engine.unsubscribe_folder(folder.folder_id).unwrap();
+        engine
+            .subscribe_folder(folder.folder_id, SyncMode::ReadOnly)
+            .unwrap();
+
+        let subs = engine.folder_subscriptions(folder.folder_id);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].mode, SyncMode::ReadOnly);
+    }
+
+    #[test]
+    fn test_unsubscribe_folder() {
+        let (mut engine, _cb) = make_engine("NAS");
+        let (folder, _) = engine.create_folder("Photos").unwrap();
+
+        engine.unsubscribe_folder(folder.folder_id).unwrap();
+        let subs = engine.folder_subscriptions(folder.folder_id);
+        assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn test_subscribe_nonexistent_folder() {
+        let (mut engine, _cb) = make_engine("NAS");
+        let result = engine.subscribe_folder(FolderId::from_data(b"nope"), SyncMode::ReadWrite);
+        assert!(matches!(result, Err(EngineError::FolderNotFound(_))));
+    }
+
     // --- File management ---
 
     #[test]
     fn test_add_file() {
-        let (mut engine, cb) = make_engine("NAS");
-        let (meta, data) = make_file_data(b"hello world");
+        let (mut engine, cb, folder_id) = make_engine_with_folder("NAS");
+        let (meta, data) = make_file_data(b"hello world", folder_id);
 
         engine.add_file(meta.clone(), data).unwrap();
 
-        assert!(engine.state().files.contains_key(&meta.blob_hash));
+        let key = (folder_id, "test.txt".to_string());
+        assert!(engine.state().files.contains_key(&key));
 
         // Callback: blob received.
         let blobs = cb.blobs.lock().unwrap();
@@ -587,8 +937,8 @@ mod tests {
 
     #[test]
     fn test_add_duplicate_file_rejected() {
-        let (mut engine, _cb) = make_engine("NAS");
-        let (meta, data) = make_file_data(b"duplicate");
+        let (mut engine, _cb, folder_id) = make_engine_with_folder("NAS");
+        let (meta, data) = make_file_data(b"duplicate", folder_id);
 
         engine.add_file(meta.clone(), data.clone()).unwrap();
         let result = engine.add_file(meta, data);
@@ -597,14 +947,16 @@ mod tests {
 
     #[test]
     fn test_add_file_bad_hash_rejected() {
-        let (mut engine, _cb) = make_engine("NAS");
+        let (mut engine, _cb, folder_id) = make_engine_with_folder("NAS");
         let data = b"actual content".to_vec();
         let meta = FileMetadata {
             blob_hash: BlobHash::from_data(b"wrong content"),
-            filename: "bad.txt".to_string(),
+            folder_id,
+            path: "bad.txt".to_string(),
             size: data.len() as u64,
             mime_type: None,
             created_at: 0,
+            modified_at: 0,
             device_origin: DeviceId::from_data(b"x"),
         };
         let result = engine.add_file(meta, data);
@@ -613,11 +965,174 @@ mod tests {
 
     #[test]
     fn test_add_file_on_dag_entry_callback() {
-        let (mut engine, cb) = make_engine("NAS");
+        let (mut engine, cb, folder_id) = make_engine_with_folder("NAS");
         let initial_count = cb.dag_entries.lock().unwrap().len();
-        let (meta, data) = make_file_data(b"content");
+        let (meta, data) = make_file_data(b"content", folder_id);
         engine.add_file(meta, data).unwrap();
         assert!(cb.dag_entries.lock().unwrap().len() > initial_count);
+    }
+
+    #[test]
+    fn test_add_file_not_subscribed() {
+        let (mut engine, _cb) = make_engine("NAS");
+        let (folder, _) = engine.create_folder("Photos").unwrap();
+        engine.unsubscribe_folder(folder.folder_id).unwrap();
+
+        let (meta, data) = make_file_data(b"content", folder.folder_id);
+        let result = engine.add_file(meta, data);
+        assert!(matches!(result, Err(EngineError::NotSubscribed(_))));
+    }
+
+    #[test]
+    fn test_add_file_read_only_rejected() {
+        let (mut engine, _cb) = make_engine("NAS");
+        let (folder, _) = engine.create_folder("Photos").unwrap();
+        engine.unsubscribe_folder(folder.folder_id).unwrap();
+        engine
+            .subscribe_folder(folder.folder_id, SyncMode::ReadOnly)
+            .unwrap();
+
+        let (meta, data) = make_file_data(b"content", folder.folder_id);
+        let result = engine.add_file(meta, data);
+        assert!(matches!(result, Err(EngineError::ReadOnlyFolder(_))));
+    }
+
+    #[test]
+    fn test_modify_file() {
+        let (mut engine, _cb, folder_id) = make_engine_with_folder("NAS");
+        let (meta, data) = make_file_data(b"version 1", folder_id);
+        engine.add_file(meta.clone(), data).unwrap();
+
+        // Modify the file.
+        let new_data = b"version 2".to_vec();
+        let new_hash = BlobHash::from_data(&new_data);
+        let new_meta = FileMetadata {
+            blob_hash: new_hash,
+            folder_id,
+            path: "test.txt".to_string(),
+            size: new_data.len() as u64,
+            mime_type: None,
+            created_at: 0,
+            modified_at: 1,
+            device_origin: engine.device_id(),
+        };
+        engine
+            .modify_file(folder_id, "test.txt", new_meta, new_data)
+            .unwrap();
+
+        // Check version history.
+        let history = engine.file_history(folder_id, "test.txt");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].0, meta.blob_hash);
+        assert_eq!(history[1].0, new_hash);
+    }
+
+    #[test]
+    fn test_file_history_ordered() {
+        let (mut engine, _cb, folder_id) = make_engine_with_folder("NAS");
+        let (meta, data) = make_file_data(b"v1", folder_id);
+        engine.add_file(meta, data).unwrap();
+
+        let history = engine.file_history(folder_id, "test.txt");
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn test_folder_files_scoped() {
+        let (mut engine, _cb) = make_engine("NAS");
+        let (folder_a, _) = engine.create_folder("FolderA").unwrap();
+        let (folder_b, _) = engine.create_folder("FolderB").unwrap();
+
+        let data_a = b"file in A".to_vec();
+        let meta_a = FileMetadata {
+            blob_hash: BlobHash::from_data(&data_a),
+            folder_id: folder_a.folder_id,
+            path: "a.txt".to_string(),
+            size: data_a.len() as u64,
+            mime_type: None,
+            created_at: 0,
+            modified_at: 0,
+            device_origin: engine.device_id(),
+        };
+        engine.add_file(meta_a, data_a).unwrap();
+
+        let data_b = b"file in B".to_vec();
+        let meta_b = FileMetadata {
+            blob_hash: BlobHash::from_data(&data_b),
+            folder_id: folder_b.folder_id,
+            path: "b.txt".to_string(),
+            size: data_b.len() as u64,
+            mime_type: None,
+            created_at: 0,
+            modified_at: 0,
+            device_origin: engine.device_id(),
+        };
+        engine.add_file(meta_b, data_b).unwrap();
+
+        assert_eq!(engine.folder_files(folder_a.folder_id).len(), 1);
+        assert_eq!(engine.folder_files(folder_b.folder_id).len(), 1);
+        assert_eq!(engine.folder_files(folder_a.folder_id)[0].path, "a.txt");
+    }
+
+    #[test]
+    fn test_same_path_different_folders() {
+        let (mut engine, _cb) = make_engine("NAS");
+        let (folder_a, _) = engine.create_folder("FolderA").unwrap();
+        let (folder_b, _) = engine.create_folder("FolderB").unwrap();
+
+        let data1 = b"content A".to_vec();
+        let meta1 = FileMetadata {
+            blob_hash: BlobHash::from_data(&data1),
+            folder_id: folder_a.folder_id,
+            path: "same.txt".to_string(),
+            size: data1.len() as u64,
+            mime_type: None,
+            created_at: 0,
+            modified_at: 0,
+            device_origin: engine.device_id(),
+        };
+        engine.add_file(meta1, data1).unwrap();
+
+        let data2 = b"content B".to_vec();
+        let meta2 = FileMetadata {
+            blob_hash: BlobHash::from_data(&data2),
+            folder_id: folder_b.folder_id,
+            path: "same.txt".to_string(),
+            size: data2.len() as u64,
+            mime_type: None,
+            created_at: 0,
+            modified_at: 0,
+            device_origin: engine.device_id(),
+        };
+        engine.add_file(meta2, data2).unwrap();
+
+        // Both should exist independently.
+        assert_eq!(engine.state().files.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_folder_does_not_affect_other_folders() {
+        let (mut engine, _cb) = make_engine("NAS");
+        let (folder_a, _) = engine.create_folder("FolderA").unwrap();
+        let (folder_b, _) = engine.create_folder("FolderB").unwrap();
+
+        let data = b"file in B".to_vec();
+        let meta = FileMetadata {
+            blob_hash: BlobHash::from_data(&data),
+            folder_id: folder_b.folder_id,
+            path: "keep.txt".to_string(),
+            size: data.len() as u64,
+            mime_type: None,
+            created_at: 0,
+            modified_at: 0,
+            device_origin: engine.device_id(),
+        };
+        engine.add_file(meta, data).unwrap();
+
+        engine.remove_folder(folder_a.folder_id).unwrap();
+
+        assert_eq!(engine.list_folders().len(), 1);
+        assert_eq!(engine.folder_files(folder_b.folder_id).len(), 1);
     }
 
     // --- Access control ---
@@ -682,7 +1197,7 @@ mod tests {
 
     #[test]
     fn test_receive_entry() {
-        let (mut engine1, _cb1) = make_engine("NAS");
+        let (mut engine1, _cb1, folder_id) = make_engine_with_folder("NAS");
         let (id2, sk2) = make_keypair();
         let cb2 = Arc::new(TestCallbacks::default());
 
@@ -694,7 +1209,7 @@ mod tests {
         let pre_entries = engine1.all_entries();
         engine2.receive_sync_entries(pre_entries).unwrap();
 
-        let (meta, data) = make_file_data(b"sync me");
+        let (meta, data) = make_file_data(b"sync me", folder_id);
         let entry = engine1.add_file(meta, data).unwrap();
 
         engine2.receive_entry(entry).unwrap();
@@ -731,7 +1246,7 @@ mod tests {
 
     #[test]
     fn test_two_devices_add_files_concurrently() {
-        let (mut engine1, _cb1) = make_engine("NAS");
+        let (mut engine1, _cb1, folder_id) = make_engine_with_folder("NAS");
         let (id2, sk2) = make_keypair();
         let cb2 = Arc::new(TestCallbacks::default());
 
@@ -741,11 +1256,34 @@ mod tests {
         // Engine2 joins and syncs engine1's entries.
         let mut engine2 = MurmurEngine::from_dag(Dag::new(id2, sk2), cb2);
         engine2.receive_sync_entries(engine1.all_entries()).unwrap();
+        engine2
+            .subscribe_folder(folder_id, SyncMode::ReadWrite)
+            .unwrap();
 
-        let (meta1, data1) = make_file_data(b"file from NAS");
+        let data1 = b"file from NAS".to_vec();
+        let meta1 = FileMetadata {
+            blob_hash: BlobHash::from_data(&data1),
+            folder_id,
+            path: "nas-file.txt".to_string(),
+            size: data1.len() as u64,
+            mime_type: None,
+            created_at: 0,
+            modified_at: 0,
+            device_origin: engine1.device_id(),
+        };
         engine1.add_file(meta1.clone(), data1).unwrap();
 
-        let (meta2, data2) = make_file_data(b"file from Phone");
+        let data2 = b"file from Phone".to_vec();
+        let meta2 = FileMetadata {
+            blob_hash: BlobHash::from_data(&data2),
+            folder_id,
+            path: "phone-file.txt".to_string(),
+            size: data2.len() as u64,
+            mime_type: None,
+            created_at: 0,
+            modified_at: 0,
+            device_origin: DeviceId::from_data(b"phone"),
+        };
         engine2.add_file(meta2.clone(), data2).unwrap();
 
         // Sync: engine1 → engine2.
@@ -757,18 +1295,20 @@ mod tests {
         engine1.receive_sync_entries(delta2).unwrap();
 
         // Both should have both files.
-        assert!(engine1.state().files.contains_key(&meta1.blob_hash));
-        assert!(engine1.state().files.contains_key(&meta2.blob_hash));
-        assert!(engine2.state().files.contains_key(&meta1.blob_hash));
-        assert!(engine2.state().files.contains_key(&meta2.blob_hash));
+        let key1 = (folder_id, "nas-file.txt".to_string());
+        let key2 = (folder_id, "phone-file.txt".to_string());
+        assert!(engine1.state().files.contains_key(&key1));
+        assert!(engine1.state().files.contains_key(&key2));
+        assert!(engine2.state().files.contains_key(&key1));
+        assert!(engine2.state().files.contains_key(&key2));
     }
 
     #[test]
     fn test_full_sync_new_device_gets_everything() {
-        let (mut engine1, _cb1) = make_engine("NAS");
+        let (mut engine1, _cb1, folder_id) = make_engine_with_folder("NAS");
 
         // Add a file and approve a device.
-        let (meta, data) = make_file_data(b"important");
+        let (meta, data) = make_file_data(b"important", folder_id);
         engine1.add_file(meta.clone(), data).unwrap();
         let (peer_id, _) = make_keypair();
         engine1.approve_device(peer_id, DeviceRole::Backup).unwrap();
@@ -782,7 +1322,8 @@ mod tests {
         engine2.receive_sync_entries(all).unwrap();
 
         // Engine2 should have the file and the approved device.
-        assert!(engine2.state().files.contains_key(&meta.blob_hash));
+        let key = (folder_id, "test.txt".to_string());
+        assert!(engine2.state().files.contains_key(&key));
         assert!(engine2.state().devices.contains_key(&peer_id));
     }
 
@@ -790,7 +1331,7 @@ mod tests {
 
     #[test]
     fn test_maybe_merge() {
-        let (mut engine1, _cb1) = make_engine("NAS");
+        let (mut engine1, _cb1, folder_id) = make_engine_with_folder("NAS");
         let (id2, sk2) = make_keypair();
         let cb2 = Arc::new(TestCallbacks::default());
 
@@ -800,12 +1341,35 @@ mod tests {
         // Engine2 joins and syncs.
         let mut engine2 = MurmurEngine::from_dag(Dag::new(id2, sk2), cb2);
         engine2.receive_sync_entries(engine1.all_entries()).unwrap();
+        engine2
+            .subscribe_folder(folder_id, SyncMode::ReadWrite)
+            .unwrap();
 
-        let (meta1, data1) = make_file_data(b"a");
-        engine1.add_file(meta1, data1).unwrap();
+        let data_a = b"a".to_vec();
+        let meta_a = FileMetadata {
+            blob_hash: BlobHash::from_data(&data_a),
+            folder_id,
+            path: "a.txt".to_string(),
+            size: data_a.len() as u64,
+            mime_type: None,
+            created_at: 0,
+            modified_at: 0,
+            device_origin: engine1.device_id(),
+        };
+        engine1.add_file(meta_a, data_a).unwrap();
 
-        let (meta2, data2) = make_file_data(b"b");
-        engine2.add_file(meta2, data2).unwrap();
+        let data_b = b"b".to_vec();
+        let meta_b = FileMetadata {
+            blob_hash: BlobHash::from_data(&data_b),
+            folder_id,
+            path: "b.txt".to_string(),
+            size: data_b.len() as u64,
+            mime_type: None,
+            created_at: 0,
+            modified_at: 0,
+            device_origin: DeviceId::from_data(b"phone"),
+        };
+        engine2.add_file(meta_b, data_b).unwrap();
 
         // Sync engine2's entries into engine1 → creates 2+ tips.
         let delta = engine2.compute_delta(engine1.tips());

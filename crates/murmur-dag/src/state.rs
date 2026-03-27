@@ -2,22 +2,31 @@
 
 use std::collections::BTreeMap;
 
-use murmur_types::{AccessGrant, Action, BlobHash, DeviceId, DeviceInfo, DeviceRole, FileMetadata};
+use murmur_types::{
+    AccessGrant, Action, BlobHash, DeviceId, DeviceInfo, DeviceRole, FileMetadata, FolderId,
+    FolderSubscription, SharedFolder,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::DagEntry;
 
 /// The materialized state: a derived cache rebuilt by replaying the DAG.
 ///
-/// This is the "current view" of the network: which devices exist, what files
-/// are tracked, and which access grants are active. It is always reconstructible
-/// from the DAG entries.
+/// This is the "current view" of the network: which devices exist, what folders
+/// and files are tracked, folder subscriptions, and which access grants are active.
+/// It is always reconstructible from the DAG entries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MaterializedState {
     /// All known devices and their status.
     pub devices: BTreeMap<DeviceId, DeviceInfo>,
-    /// All known files indexed by blob hash.
-    pub files: BTreeMap<BlobHash, FileMetadata>,
+    /// All shared folders.
+    pub folders: BTreeMap<FolderId, SharedFolder>,
+    /// Folder subscriptions keyed by `(folder_id, device_id)`.
+    pub subscriptions: BTreeMap<(FolderId, DeviceId), FolderSubscription>,
+    /// All known files indexed by `(folder_id, path)`.
+    pub files: BTreeMap<(FolderId, String), FileMetadata>,
+    /// File version history: `(folder_id, path) → [(blob_hash, hlc)]` ordered by HLC.
+    pub file_versions: BTreeMap<(FolderId, String), Vec<(BlobHash, u64)>>,
     /// Active access grants.
     pub grants: Vec<AccessGrant>,
 }
@@ -84,25 +93,69 @@ impl MaterializedState {
             }
             Action::DeviceNameChanged { device_id, name } => {
                 if let Some(info) = self.devices.get_mut(device_id) {
-                    // LWW: only apply if this entry has a higher (HLC, DeviceId).
-                    // We track the "last update" implicitly — since entries are
-                    // applied in load order, we use a simple approach: always
-                    // apply if the entry's HLC >= the device's joined_at, and
-                    // for same-HLC, compare DeviceId.
-                    //
-                    // For proper LWW we'd need per-field timestamps, but for v1
-                    // the approach of "last applied wins" with deterministic
-                    // replay ordering is sufficient. The `load_entry` path
-                    // applies in insertion order, and for tiebreaking we rely
-                    // on the caller to order by (HLC, DeviceId).
                     info.name = name.clone();
                 }
             }
-            Action::FileAdded { metadata } => {
-                self.files.insert(metadata.blob_hash, metadata.clone());
+            Action::FolderCreated { folder } => {
+                self.folders
+                    .entry(folder.folder_id)
+                    .or_insert_with(|| folder.clone());
             }
-            Action::FileDeleted { blob_hash } => {
-                self.files.remove(blob_hash);
+            Action::FolderRemoved { folder_id } => {
+                self.folders.remove(folder_id);
+                // Remove all subscriptions for this folder.
+                self.subscriptions.retain(|(fid, _), _| *fid != *folder_id);
+                // Remove all files in this folder.
+                self.files.retain(|(fid, _), _| *fid != *folder_id);
+                self.file_versions.retain(|(fid, _), _| *fid != *folder_id);
+            }
+            Action::FolderSubscribed {
+                folder_id,
+                device_id,
+                mode,
+            } => {
+                self.subscriptions.insert(
+                    (*folder_id, *device_id),
+                    FolderSubscription {
+                        folder_id: *folder_id,
+                        device_id: *device_id,
+                        mode: *mode,
+                    },
+                );
+            }
+            Action::FolderUnsubscribed {
+                folder_id,
+                device_id,
+            } => {
+                self.subscriptions.remove(&(*folder_id, *device_id));
+            }
+            Action::FileAdded { metadata } => {
+                let key = (metadata.folder_id, metadata.path.clone());
+                self.files.insert(key.clone(), metadata.clone());
+                // Add to version history.
+                self.file_versions
+                    .entry(key)
+                    .or_default()
+                    .push((metadata.blob_hash, entry.hlc));
+            }
+            Action::FileModified {
+                folder_id,
+                path,
+                new_hash: _,
+                old_hash: _,
+                metadata,
+            } => {
+                let key = (*folder_id, path.clone());
+                self.files.insert(key.clone(), metadata.clone());
+                // Append to version history.
+                self.file_versions
+                    .entry(key)
+                    .or_default()
+                    .push((metadata.blob_hash, entry.hlc));
+            }
+            Action::FileDeleted { folder_id, path } => {
+                let key = (*folder_id, path.clone());
+                self.files.remove(&key);
             }
             Action::AccessGranted { grant } => {
                 // Remove any existing grant to the same device first.

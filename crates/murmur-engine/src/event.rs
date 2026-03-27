@@ -1,6 +1,6 @@
 //! Engine events emitted to the platform.
 
-use murmur_types::{BlobHash, DeviceId, DeviceRole};
+use murmur_types::{BlobHash, DeviceId, DeviceRole, FolderId, SyncMode};
 
 /// Events emitted by the engine to notify the platform of state changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,12 +24,39 @@ pub enum EngineEvent {
         /// The revoked device's ID.
         device_id: DeviceId,
     },
+    /// A folder was created.
+    FolderCreated {
+        /// The folder's ID.
+        folder_id: FolderId,
+        /// The folder's name.
+        name: String,
+    },
+    /// A device subscribed to a folder.
+    FolderSubscribed {
+        /// The folder's ID.
+        folder_id: FolderId,
+        /// The subscribing device.
+        device_id: DeviceId,
+        /// The sync mode.
+        mode: SyncMode,
+    },
     /// A file was synced (DAG entry received).
     FileSynced {
         /// The file's content hash.
         blob_hash: BlobHash,
-        /// The filename.
-        filename: String,
+        /// The folder ID.
+        folder_id: FolderId,
+        /// The file's path within the folder.
+        path: String,
+    },
+    /// A file was modified (new version).
+    FileModified {
+        /// The folder ID.
+        folder_id: FolderId,
+        /// The file's path within the folder.
+        path: String,
+        /// New content hash.
+        new_hash: BlobHash,
     },
     /// A blob was received from a peer.
     BlobReceived {

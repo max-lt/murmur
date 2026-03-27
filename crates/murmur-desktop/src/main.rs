@@ -15,7 +15,7 @@ use iced::widget::{button, column, container, row, rule, scrollable, text, text_
 use iced::{Element, Length, Task, Theme};
 
 use murmur_engine::{EngineEvent, MurmurEngine};
-use murmur_types::{BlobHash, DeviceInfo, DeviceRole, FileMetadata, NetworkId};
+use murmur_types::{BlobHash, DeviceInfo, DeviceRole, FileMetadata, FolderId, NetworkId};
 
 use storage::{DesktopPlatform, Storage};
 
@@ -541,7 +541,7 @@ impl App {
                 let size_str = format_size(file.size);
                 let mime = file.mime_type.as_deref().unwrap_or("—");
                 let r = row![
-                    text(&file.filename).width(Length::Fill),
+                    text(&file.path).width(Length::Fill),
                     text(size_str).width(Length::Fixed(100.0)),
                     text(mime).width(Length::Fixed(120.0)),
                 ]
@@ -902,15 +902,19 @@ impl App {
             .ok_or_else(|| anyhow::anyhow!("engine not initialized"))?;
         let mut eng = engine.lock().unwrap();
 
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         let metadata = FileMetadata {
             blob_hash,
-            filename: filename.clone(),
+            folder_id: FolderId::from_bytes([0u8; 32]),
+            path: filename.clone(),
             size: data.len() as u64,
             mime_type,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            created_at: now,
+            modified_at: now,
             device_origin: eng.device_id(),
         };
 

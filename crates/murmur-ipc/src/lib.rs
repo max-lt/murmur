@@ -139,8 +139,10 @@ pub struct DeviceInfoIpc {
 pub struct FileInfoIpc {
     /// Blob hash (hex).
     pub blob_hash: String,
-    /// Filename.
-    pub filename: String,
+    /// Folder ID (hex).
+    pub folder_id: String,
+    /// Relative path within folder.
+    pub path: String,
     /// File size in bytes.
     pub size: u64,
     /// MIME type (if known).
@@ -317,7 +319,8 @@ mod tests {
         let resp = CliResponse::Files {
             files: vec![FileInfoIpc {
                 blob_hash: "ef".repeat(32),
-                filename: "photo.jpg".to_string(),
+                folder_id: "cc".repeat(32),
+                path: "photos/photo.jpg".to_string(),
                 size: 1024,
                 mime_type: Some("image/jpeg".to_string()),
                 device_origin: "ab".repeat(32),

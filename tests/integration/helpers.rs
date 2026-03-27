@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::SigningKey;
 use murmur_engine::{EngineEvent, MurmurEngine, PlatformCallbacks};
-use murmur_types::{AccessGrant, AccessScope, BlobHash, DeviceId, DeviceRole, FileMetadata};
+use murmur_types::{
+    AccessGrant, AccessScope, BlobHash, DeviceId, DeviceRole, FileMetadata, FolderId, SyncMode,
+};
 
 /// Test platform callbacks that capture all events, entries, and blobs.
 #[derive(Default)]
@@ -107,16 +109,40 @@ pub fn make_grant(
 }
 
 /// Create test file metadata and data.
-pub fn make_file(content: &[u8], filename: &str, origin: DeviceId) -> (FileMetadata, Vec<u8>) {
+pub fn make_file(
+    content: &[u8],
+    filename: &str,
+    origin: DeviceId,
+    folder_id: FolderId,
+) -> (FileMetadata, Vec<u8>) {
     let data = content.to_vec();
     let blob_hash = BlobHash::from_data(&data);
     let meta = FileMetadata {
         blob_hash,
-        filename: filename.to_string(),
+        folder_id,
+        path: filename.to_string(),
         size: data.len() as u64,
         mime_type: None,
         created_at: 0,
+        modified_at: 0,
         device_origin: origin,
     };
     (meta, data)
+}
+
+/// Create a default shared folder on an engine and return its `FolderId`.
+///
+/// The engine that creates the folder is auto-subscribed as ReadWrite.
+pub fn create_test_folder(engine: &mut MurmurEngine) -> FolderId {
+    let (folder, _) = engine.create_folder("test").unwrap();
+    folder.folder_id
+}
+
+/// Subscribe an engine to a folder as ReadWrite.
+///
+/// The folder must already exist in the engine's DAG (i.e., synced from the creator).
+pub fn subscribe_test_folder(engine: &mut MurmurEngine, folder_id: FolderId) {
+    engine
+        .subscribe_folder(folder_id, SyncMode::ReadWrite)
+        .unwrap();
 }

@@ -30,8 +30,14 @@ fn test_two_device_full_sync() {
         .approve_device(device_b_id, DeviceRole::Source)
         .unwrap();
 
+    // A creates a shared folder.
+    let folder_id = create_test_folder(&mut engine_a);
+
     // Sync everything A → B.
     sync_engines(&engine_a, &mut engine_b);
+
+    // B subscribes to the folder.
+    subscribe_test_folder(&mut engine_b, folder_id);
 
     // B should see itself as approved.
     let b_info = engine_b.state().devices.get(&device_b_id).unwrap();
@@ -43,29 +49,52 @@ fn test_two_device_full_sync() {
     assert_eq!(engine_b.list_devices().len(), 2);
 
     // B adds a file.
-    let (meta, data) = make_file(b"photo from phone", "photo.jpg", device_b_id);
-    let hash_b = meta.blob_hash;
+    let (meta, data) = make_file(b"photo from phone", "photo.jpg", device_b_id, folder_id);
     engine_b.add_file(meta, data).unwrap();
 
     // Sync B → A.
     sync_engines(&engine_b, &mut engine_a);
 
     // A should have the file in its state.
-    assert!(engine_a.state().files.contains_key(&hash_b));
+    assert!(
+        engine_a
+            .state()
+            .files
+            .contains_key(&(folder_id, "photo.jpg".to_string()))
+    );
 
     // A adds a file too.
-    let (meta_a, data_a) = make_file(b"backup log", "backup.log", device_a_id);
-    let hash_a = meta_a.blob_hash;
+    let (meta_a, data_a) = make_file(b"backup log", "backup.log", device_a_id, folder_id);
     engine_a.add_file(meta_a, data_a).unwrap();
 
     // Bidirectional sync.
     bidirectional_sync(&mut engine_a, &mut engine_b);
 
     // Both should have both files.
-    assert!(engine_a.state().files.contains_key(&hash_b));
-    assert!(engine_a.state().files.contains_key(&hash_a));
-    assert!(engine_b.state().files.contains_key(&hash_b));
-    assert!(engine_b.state().files.contains_key(&hash_a));
+    assert!(
+        engine_a
+            .state()
+            .files
+            .contains_key(&(folder_id, "photo.jpg".to_string()))
+    );
+    assert!(
+        engine_a
+            .state()
+            .files
+            .contains_key(&(folder_id, "backup.log".to_string()))
+    );
+    assert!(
+        engine_b
+            .state()
+            .files
+            .contains_key(&(folder_id, "photo.jpg".to_string()))
+    );
+    assert!(
+        engine_b
+            .state()
+            .files
+            .contains_key(&(folder_id, "backup.log".to_string()))
+    );
 
     // Verify events on B's side.
     let events_b = cb_b.events.lock().unwrap();
@@ -89,11 +118,14 @@ fn test_two_device_concurrent_files() {
     // A approves B and they sync.
     join_approve_sync(&mut engine_a, &mut engine_b, id_b, DeviceRole::Full);
 
+    // A creates a folder, sync to B, B subscribes.
+    let folder_id = create_test_folder(&mut engine_a);
+    sync_engines(&engine_a, &mut engine_b);
+    subscribe_test_folder(&mut engine_b, folder_id);
+
     // Both add files independently (no sync yet).
-    let (meta_a, data_a) = make_file(b"file from A", "a.txt", id_a);
-    let (meta_b, data_b) = make_file(b"file from B", "b.txt", id_b);
-    let hash_a = meta_a.blob_hash;
-    let hash_b = meta_b.blob_hash;
+    let (meta_a, data_a) = make_file(b"file from A", "a.txt", id_a, folder_id);
+    let (meta_b, data_b) = make_file(b"file from B", "b.txt", id_b, folder_id);
     engine_a.add_file(meta_a, data_a).unwrap();
     engine_b.add_file(meta_b, data_b).unwrap();
 
@@ -103,10 +135,30 @@ fn test_two_device_concurrent_files() {
     // Both should have both files.
     assert_eq!(engine_a.state().files.len(), 2);
     assert_eq!(engine_b.state().files.len(), 2);
-    assert!(engine_a.state().files.contains_key(&hash_a));
-    assert!(engine_a.state().files.contains_key(&hash_b));
-    assert!(engine_b.state().files.contains_key(&hash_a));
-    assert!(engine_b.state().files.contains_key(&hash_b));
+    assert!(
+        engine_a
+            .state()
+            .files
+            .contains_key(&(folder_id, "a.txt".to_string()))
+    );
+    assert!(
+        engine_a
+            .state()
+            .files
+            .contains_key(&(folder_id, "b.txt".to_string()))
+    );
+    assert!(
+        engine_b
+            .state()
+            .files
+            .contains_key(&(folder_id, "a.txt".to_string()))
+    );
+    assert!(
+        engine_b
+            .state()
+            .files
+            .contains_key(&(folder_id, "b.txt".to_string()))
+    );
 
     // After merge, tips should converge.
     engine_a.maybe_merge();
@@ -126,20 +178,22 @@ fn test_two_device_deduplication() {
     // A approves B and they sync.
     join_approve_sync(&mut engine_a, &mut engine_b, id_b, DeviceRole::Full);
 
+    // A creates a folder, sync to B, B subscribes.
+    let folder_id = create_test_folder(&mut engine_a);
+    sync_engines(&engine_a, &mut engine_b);
+    subscribe_test_folder(&mut engine_b, folder_id);
+
     let content = b"identical content on both devices";
 
     // A adds the file.
-    let (meta_a, data_a) = make_file(content, "a_copy.txt", id_a);
-    let hash_a = meta_a.blob_hash;
+    let (meta_a, data_a) = make_file(content, "copy.txt", id_a, folder_id);
     engine_a.add_file(meta_a, data_a).unwrap();
 
     // Sync A → B.
     sync_engines(&engine_a, &mut engine_b);
 
-    // B tries to add the same content — should be rejected (dedup).
-    let (meta_b, data_b) = make_file(content, "b_copy.txt", id_b);
-    // Same blob hash, so it's a duplicate.
-    assert_eq!(hash_a, meta_b.blob_hash);
+    // B tries to add the same file at the same path — should be rejected (dedup).
+    let (meta_b, data_b) = make_file(content, "copy.txt", id_b, folder_id);
     let result = engine_b.add_file(meta_b, data_b);
     assert!(result.is_err()); // FileAlreadyExists
 
@@ -157,12 +211,17 @@ fn test_two_device_delta_sync() {
     // A approves B and they sync.
     join_approve_sync(&mut engine_a, &mut engine_b, id_b, DeviceRole::Full);
 
+    // A creates a folder and syncs to B.
+    let folder_id = create_test_folder(&mut engine_a);
+    sync_engines(&engine_a, &mut engine_b);
+
     // A adds 3 files.
     for i in 0..3 {
         let (meta, data) = make_file(
             format!("file {i}").as_bytes(),
             &format!("file_{i}.txt"),
             id_a,
+            folder_id,
         );
         engine_a.add_file(meta, data).unwrap();
     }

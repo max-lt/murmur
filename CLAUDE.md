@@ -179,6 +179,21 @@ When fixing a reported bug:
 4. Run the test to confirm it passes
 5. Run the full test suite to ensure no regressions
 
+## Folder Sync Architecture (Milestones 13–20)
+
+Murmur is evolving into a Syncthing-style folder sync app. Key design decisions:
+
+- **Shared folders** map to real directories on each device. murmurd watches them with `notify`.
+- **Per-device subscribe model**: each device chooses which folders to sync and whether read-write or read-only.
+- **File versioning**: `FileModified` action in DAG tracks explicit version chains per `(folder, path)`.
+- **Conflict resolution**: fork-based — concurrent edits produce conflict files on disk, user resolves.
+- **Three frontends**: Desktop app (iced), Web UI (htmx/axum), CLI — all thin clients to murmurd via IPC.
+- **Streaming blobs**: no hard size limit, incremental blake3, chunked transfer, bounded memory.
+- **Ignore patterns**: `.murmurignore` per folder (gitignore syntax) via `ignore` crate.
+- **Protocol spec**: `docs/protocol.md` — formal specification for third-party interoperability.
+
+See @docs/plan.md for full milestone details and design rationale.
+
 ## Things to Avoid
 
 - No `unwrap()` in library code. Use proper error propagation
