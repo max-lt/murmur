@@ -33,4 +33,38 @@ pub trait PlatformCallbacks: Send + Sync {
     fn on_event(&self, event: EngineEvent) {
         let _ = event;
     }
+
+    // --- Streaming blob transfer callbacks ---
+
+    /// Called when a streaming blob transfer begins.
+    ///
+    /// The platform should prepare to receive chunks (e.g., create a temp file).
+    fn on_blob_stream_start(&self, blob_hash: BlobHash, total_size: u64) {
+        let _ = (blob_hash, total_size);
+    }
+
+    /// Called with each chunk of a streaming blob transfer.
+    ///
+    /// `offset` is the byte offset within the full blob. The platform should
+    /// append/write the data to its temporary storage.
+    fn on_blob_chunk(&self, blob_hash: BlobHash, offset: u64, data: &[u8]) {
+        let _ = (blob_hash, offset, data);
+    }
+
+    /// Called when a streaming blob transfer is complete.
+    ///
+    /// The platform should verify the blob's integrity (blake3 hash) and
+    /// finalize storage (e.g., rename temp file to final path). Returns an
+    /// error string if verification or storage fails.
+    fn on_blob_stream_complete(&self, blob_hash: BlobHash) -> Result<(), String> {
+        let _ = blob_hash;
+        Ok(())
+    }
+
+    /// Called when a streaming blob transfer is aborted (e.g., due to error).
+    ///
+    /// The platform should clean up any temporary storage.
+    fn on_blob_stream_abort(&self, blob_hash: BlobHash) {
+        let _ = blob_hash;
+    }
 }

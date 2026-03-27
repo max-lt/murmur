@@ -17,7 +17,7 @@ For a feature overview, see [features.md](features.md).
 | 12 — Hardening                         | ✅ Complete (networking foundations, security, performance, observability, reliability)                |
 | 13 — Folder Model & File Versioning    | ✅ Complete (types, DAG state, engine methods, auto-folder in murmurd, all tests pass)                |
 | 14 — Conflict Detection & Resolution   | ✅ Complete (types, DAG ancestry check, conflict detection/resolution, engine methods, all tests pass) |
-| 15 — Streaming Blob Storage & Transfer | 🔲 Planned                                                                                           |
+| 15 — Streaming Blob Storage & Transfer | ✅ Complete (streaming blake3, streaming callbacks, add_file_streaming, temp storage, paced chunking) |
 | 16 — Filesystem Watching & Ignore      | 🔲 Planned                                                                                           |
 | 17 — IPC & CLI Expansion               | 🔲 Planned                                                                                           |
 | 18 — Desktop App (iced)                | 🔲 Planned                                                                                           |
@@ -298,27 +298,27 @@ Consumer:  network → chunks → temp file → verify hash → rename to final 
 
 **Tasks**:
 
-- [ ] Remove `MAX_BLOB_SIZE` hard limit
-- [ ] Implement streaming blake3 hash computation (read file in 64 KiB buffers)
-- [ ] Add `add_file_streaming()` to engine — accepts `&Path`, streams from disk
-- [ ] Add streaming callbacks to `PlatformCallbacks`: `on_blob_stream_start`, `on_blob_chunk`, `on_blob_stream_complete`
-- [ ] Update `murmur-net` blob transfer: chunked send with backpressure
-- [ ] Update `murmur-net` blob receive: reassemble chunks to temp file
-- [ ] Update `FjallPlatform` in `murmurd`: implement streaming callbacks, temp dir, atomic rename
-- [ ] Add flow control: max 4 chunks in flight per transfer, ack-based pacing
-- [ ] Update `EngineEvent::BlobTransferProgress` to report streaming progress
+- [x] Remove `MAX_BLOB_SIZE` hard limit
+- [x] Implement streaming blake3 hash computation (read file in 64 KiB buffers)
+- [x] Add `add_file_streaming()` to engine — accepts `&Path`, streams from disk
+- [x] Add streaming callbacks to `PlatformCallbacks`: `on_blob_stream_start`, `on_blob_chunk`, `on_blob_stream_complete`
+- [x] Update `murmur-net` blob transfer: chunked send with backpressure
+- [x] Update `murmur-net` blob receive: reassemble chunks to temp file
+- [x] Update `FjallPlatform` in `murmurd`: implement streaming callbacks, temp dir, atomic rename
+- [x] Add flow control: max 4 chunks in flight per transfer, ack-based pacing
+- [x] Update `EngineEvent::BlobTransferProgress` to report streaming progress
 
 **Tests** (≥8):
 
-- [ ] Streaming blake3 hash matches single-shot hash for same content
-- [ ] `add_file_streaming()` succeeds for file >256 MiB (use tempfile)
-- [ ] Chunked transfer between two engines: file arrives intact
-- [ ] blake3 verification catches corrupted chunk
-- [ ] Temp file cleaned up on successful completion
-- [ ] Temp file cleaned up on failed/interrupted transfer
-- [ ] Memory usage stays bounded during large transfer (no full file in RAM)
-- [ ] Multiple concurrent streaming transfers complete correctly
-- [ ] Small file (<4 MiB) still uses single `BlobPush` (no chunking overhead)
+- [x] Streaming blake3 hash matches single-shot hash for same content
+- [x] `add_file_streaming()` succeeds for file >256 MiB (use tempfile)
+- [x] Chunked transfer between two engines: file arrives intact
+- [x] blake3 verification catches corrupted chunk
+- [x] Temp file cleaned up on successful completion
+- [x] Temp file cleaned up on failed/interrupted transfer
+- [x] Memory usage stays bounded during large transfer (no full file in RAM)
+- [x] Multiple concurrent streaming transfers complete correctly
+- [x] Small file (<4 MiB) still uses single `BlobPush` (no chunking overhead)
 
 ---
 

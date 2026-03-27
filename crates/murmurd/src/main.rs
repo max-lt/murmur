@@ -133,6 +133,12 @@ fn run_daemon(
     let blob_enc_key = identity.blob_encryption_key();
     storage_inner.set_blob_encryption_key(&blob_enc_key);
     let storage = Arc::new(storage_inner);
+
+    // Clean up stale streaming temp files from interrupted transfers.
+    if let Err(e) = storage.clean_stream_tmp() {
+        warn!(error = %e, "failed to clean streaming temp files");
+    }
+
     let platform = Arc::new(FjallPlatform::new(storage.clone()));
 
     // Create engine.

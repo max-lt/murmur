@@ -32,8 +32,9 @@ pub fn network_alpn(network_id: &murmur_types::NetworkId) -> Vec<u8> {
 /// Maximum message size for length-prefixed wire messages (16 MiB).
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
-/// Maximum blob size accepted in a single transfer (256 MiB).
-pub const MAX_BLOB_SIZE: usize = 256 * 1024 * 1024;
+/// Advisory maximum blob size (1 TiB). Not a hard limit — streaming transfers
+/// handle arbitrarily large files with bounded memory.
+pub const MAX_BLOB_SIZE: usize = 1024 * 1024 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Tests

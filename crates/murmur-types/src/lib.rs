@@ -88,6 +88,26 @@ define_id!(
     BlobHash
 );
 
+impl BlobHash {
+    /// Compute a BlobHash by streaming data through blake3.
+    ///
+    /// Reads in 64 KiB buffers, keeping memory usage bounded regardless of
+    /// input size. The result is identical to [`from_data`](Self::from_data)
+    /// for the same content.
+    pub fn from_reader(mut reader: impl std::io::Read) -> Result<Self, std::io::Error> {
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = [0u8; 65536]; // 64 KiB
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(Self(*hasher.finalize().as_bytes()))
+    }
+}
+
 define_id!(
     /// Network identifier derived from the seed: `blake3(hkdf(seed, "murmur/network-id"))`.
     NetworkId
@@ -524,8 +544,17 @@ pub enum GossipPayload {
         chunk_index: u32,
         /// Total number of chunks.
         total_chunks: u32,
+        /// Total size of the full blob in bytes.
+        total_size: u64,
         /// Chunk data.
         data: Vec<u8>,
+    },
+    /// Acknowledgement for a received blob chunk (flow control).
+    BlobChunkAck {
+        /// Content hash of the blob being transferred.
+        blob_hash: BlobHash,
+        /// The chunk index being acknowledged.
+        chunk_index: u32,
     },
 }
 
@@ -966,5 +995,61 @@ mod tests {
         let encoded = postcard::to_allocvec(&msg).unwrap();
         let decoded: GossipMessage = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    // --- Streaming blake3 hash tests ---
+
+    #[test]
+    fn test_blob_hash_from_reader_matches_from_data() {
+        let data = b"hello world, this is test data for streaming hash";
+        let expected = BlobHash::from_data(data);
+        let reader = std::io::Cursor::new(data);
+        let actual = BlobHash::from_reader(reader).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_blob_hash_from_reader_large_data() {
+        // 1 MiB of data — crosses the 64 KiB buffer boundary multiple times.
+        let data: Vec<u8> = (0..1_048_576).map(|i| (i % 256) as u8).collect();
+        let expected = BlobHash::from_data(&data);
+        let reader = std::io::Cursor::new(&data);
+        let actual = BlobHash::from_reader(reader).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_blob_hash_from_reader_empty() {
+        let expected = BlobHash::from_data(b"");
+        let reader = std::io::Cursor::new(b"");
+        let actual = BlobHash::from_reader(reader).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    // --- BlobChunk and BlobChunkAck roundtrip ---
+
+    #[test]
+    fn test_gossip_payload_blob_chunk_roundtrip() {
+        let payload = GossipPayload::BlobChunk {
+            blob_hash: BlobHash::from_data(b"big file"),
+            chunk_index: 3,
+            total_chunks: 10,
+            total_size: 10_485_760,
+            data: vec![0xab; 1024],
+        };
+        let encoded = postcard::to_allocvec(&payload).unwrap();
+        let decoded: GossipPayload = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn test_gossip_payload_blob_chunk_ack_roundtrip() {
+        let payload = GossipPayload::BlobChunkAck {
+            blob_hash: BlobHash::from_data(b"big file"),
+            chunk_index: 5,
+        };
+        let encoded = postcard::to_allocvec(&payload).unwrap();
+        let decoded: GossipPayload = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(payload, decoded);
     }
 }

@@ -761,6 +761,146 @@ impl MurmurEngine {
         Ok(entry)
     }
 
+    /// Add a file to a folder by streaming from disk.
+    ///
+    /// Unlike [`add_file`], this method never loads the full file into memory.
+    /// It reads the file in two passes:
+    /// 1. Streaming blake3 hash computation (64 KiB buffers)
+    /// 2. Streaming blob transfer to platform via callbacks
+    ///
+    /// The platform receives chunks via [`PlatformCallbacks::on_blob_stream_start`],
+    /// [`PlatformCallbacks::on_blob_chunk`], and [`PlatformCallbacks::on_blob_stream_complete`].
+    pub fn add_file_streaming(
+        &mut self,
+        folder_id: FolderId,
+        path: &str,
+        file_path: &std::path::Path,
+    ) -> Result<DagEntry, EngineError> {
+        use std::io::Read;
+
+        // Check folder exists.
+        if !self.dag.state().folders.contains_key(&folder_id) {
+            return Err(EngineError::FolderNotFound(folder_id.to_string()));
+        }
+
+        // Check subscription and write permission.
+        self.check_write_permission(folder_id)?;
+
+        // Dedup: skip if file already exists at this path.
+        let key = (folder_id, path.to_string());
+        if self.dag.state().files.contains_key(&key) {
+            return Err(EngineError::FileAlreadyExists(path.to_string()));
+        }
+
+        // Open file and get metadata.
+        let file = std::fs::File::open(file_path).map_err(|e| EngineError::Io(e.to_string()))?;
+        let file_meta = file
+            .metadata()
+            .map_err(|e| EngineError::Io(e.to_string()))?;
+        let file_size = file_meta.len();
+
+        // Pass 1: streaming blake3 hash computation.
+        let blob_hash = BlobHash::from_reader(file).map_err(|e| EngineError::Io(e.to_string()))?;
+
+        // Get file timestamps.
+        let created_at = file_meta
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let modified_at = file_meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Build metadata.
+        let metadata = FileMetadata {
+            blob_hash,
+            folder_id,
+            path: path.to_string(),
+            size: file_size,
+            mime_type: None,
+            created_at,
+            modified_at,
+            device_origin: self.dag.device_id(),
+        };
+
+        // Pass 2: stream file data to platform via callbacks.
+        // NOTE: DAG entry is created AFTER streaming succeeds to avoid orphaned
+        // entries when streaming fails (e.g., I/O error, hash verification failure).
+        self.callbacks.on_blob_stream_start(blob_hash, file_size);
+
+        let stream_result = (|| -> Result<(), EngineError> {
+            let mut file =
+                std::fs::File::open(file_path).map_err(|e| EngineError::Io(e.to_string()))?;
+            let mut buf = vec![0u8; 65536]; // 64 KiB
+            let mut offset = 0u64;
+
+            // Throttle progress events: emit at most every 1 MiB or every 1%.
+            let progress_interval = (file_size / 100).max(1024 * 1024).max(1);
+            let mut last_progress_at = 0u64;
+
+            loop {
+                let n = file
+                    .read(&mut buf)
+                    .map_err(|e| EngineError::Io(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                self.callbacks.on_blob_chunk(blob_hash, offset, &buf[..n]);
+                offset += n as u64;
+
+                // Emit throttled progress events.
+                if offset - last_progress_at >= progress_interval {
+                    self.callbacks.on_event(EngineEvent::BlobTransferProgress {
+                        blob_hash,
+                        bytes_transferred: offset,
+                        total_bytes: file_size,
+                    });
+                    last_progress_at = offset;
+                }
+            }
+
+            // Always emit a final progress event at 100%.
+            if last_progress_at < offset {
+                self.callbacks.on_event(EngineEvent::BlobTransferProgress {
+                    blob_hash,
+                    bytes_transferred: offset,
+                    total_bytes: file_size,
+                });
+            }
+
+            Ok(())
+        })();
+
+        if let Err(e) = stream_result {
+            self.callbacks.on_blob_stream_abort(blob_hash);
+            return Err(e);
+        }
+
+        self.callbacks
+            .on_blob_stream_complete(blob_hash)
+            .map_err(EngineError::Io)?;
+
+        // Create DAG entry only after blob is fully stored.
+        let entry = self.dag.append(Action::FileAdded {
+            metadata: metadata.clone(),
+        });
+        self.callbacks.on_dag_entry(entry.to_bytes());
+
+        debug!(%blob_hash, %path, size = file_size, "engine: file added (streaming)");
+        self.callbacks.on_event(EngineEvent::FileSynced {
+            blob_hash,
+            folder_id,
+            path: path.to_string(),
+        });
+
+        Ok(entry)
+    }
+
     /// Modify an existing file (create a new version).
     pub fn modify_file(
         &mut self,
@@ -1070,6 +1210,12 @@ mod tests {
         dag_entries: Mutex<Vec<Vec<u8>>>,
         blobs: Mutex<Vec<(BlobHash, Vec<u8>)>>,
         events: Mutex<Vec<EngineEvent>>,
+        /// Streaming blob data: hash → accumulated bytes.
+        stream_data: Mutex<std::collections::HashMap<BlobHash, Vec<u8>>>,
+        /// Track stream_start calls.
+        stream_starts: Mutex<Vec<(BlobHash, u64)>>,
+        /// Track stream_complete calls.
+        stream_completes: Mutex<Vec<BlobHash>>,
     }
 
     impl PlatformCallbacks for TestCallbacks {
@@ -1092,6 +1238,46 @@ mod tests {
 
         fn on_event(&self, event: EngineEvent) {
             self.events.lock().unwrap().push(event);
+        }
+
+        fn on_blob_stream_start(&self, blob_hash: BlobHash, total_size: u64) {
+            self.stream_starts
+                .lock()
+                .unwrap()
+                .push((blob_hash, total_size));
+            self.stream_data
+                .lock()
+                .unwrap()
+                .insert(blob_hash, Vec::new());
+        }
+
+        fn on_blob_chunk(&self, blob_hash: BlobHash, offset: u64, data: &[u8]) {
+            let mut streams = self.stream_data.lock().unwrap();
+            if let Some(buf) = streams.get_mut(&blob_hash) {
+                // Ensure buffer is large enough.
+                let needed = offset as usize + data.len();
+                if buf.len() < needed {
+                    buf.resize(needed, 0);
+                }
+                buf[offset as usize..offset as usize + data.len()].copy_from_slice(data);
+            }
+        }
+
+        fn on_blob_stream_complete(&self, blob_hash: BlobHash) -> Result<(), String> {
+            // Verify hash.
+            let streams = self.stream_data.lock().unwrap();
+            if let Some(data) = streams.get(&blob_hash) {
+                let actual = BlobHash::from_data(data);
+                if actual != blob_hash {
+                    return Err(format!("hash mismatch: expected {blob_hash}, got {actual}"));
+                }
+            }
+            self.stream_completes.lock().unwrap().push(blob_hash);
+            Ok(())
+        }
+
+        fn on_blob_stream_abort(&self, blob_hash: BlobHash) {
+            self.stream_data.lock().unwrap().remove(&blob_hash);
         }
     }
 
@@ -2531,5 +2717,199 @@ mod tests {
                 .is_none()
         );
         assert!(engine1.list_conflicts().is_empty());
+    }
+
+    // --- Streaming file add tests (M15) ---
+
+    #[test]
+    fn test_add_file_streaming_creates_dag_entry() {
+        let (mut engine, cb, folder_id) = make_engine_with_folder("NAS");
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, b"streaming file content").unwrap();
+
+        let entry = engine
+            .add_file_streaming(folder_id, "test.txt", &file_path)
+            .unwrap();
+
+        assert!(matches!(entry.action, Action::FileAdded { .. }));
+        let files = engine.folder_files(folder_id);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "test.txt");
+        assert_eq!(files[0].size, 22); // "streaming file content".len()
+
+        // Verify blob hash matches content.
+        let expected_hash = BlobHash::from_data(b"streaming file content");
+        assert_eq!(files[0].blob_hash, expected_hash);
+
+        // Verify streaming callbacks were invoked.
+        let starts = cb.stream_starts.lock().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].0, expected_hash);
+        assert_eq!(starts[0].1, 22);
+
+        let completes = cb.stream_completes.lock().unwrap();
+        assert_eq!(completes.len(), 1);
+        assert_eq!(completes[0], expected_hash);
+    }
+
+    #[test]
+    fn test_add_file_streaming_data_arrives_intact() {
+        let (mut engine, cb, folder_id) = make_engine_with_folder("NAS");
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"the quick brown fox jumps over the lazy dog";
+        let file_path = dir.path().join("fox.txt");
+        std::fs::write(&file_path, content).unwrap();
+
+        engine
+            .add_file_streaming(folder_id, "fox.txt", &file_path)
+            .unwrap();
+
+        // Verify streamed data matches file content.
+        let hash = BlobHash::from_data(content);
+        let streams = cb.stream_data.lock().unwrap();
+        let received = streams.get(&hash).unwrap();
+        assert_eq!(received.as_slice(), content);
+    }
+
+    #[test]
+    fn test_add_file_streaming_large_file() {
+        let (mut engine, cb, folder_id) = make_engine_with_folder("NAS");
+        let dir = tempfile::tempdir().unwrap();
+
+        // 5 MiB file — exceeds CHUNK_THRESHOLD, crosses multiple 64 KiB read buffers.
+        let size = 5 * 1024 * 1024;
+        let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let file_path = dir.path().join("large.bin");
+        std::fs::write(&file_path, &content).unwrap();
+
+        let entry = engine
+            .add_file_streaming(folder_id, "large.bin", &file_path)
+            .unwrap();
+
+        // Verify DAG entry.
+        let expected_hash = BlobHash::from_data(&content);
+        if let Action::FileAdded { metadata } = &entry.action {
+            assert_eq!(metadata.blob_hash, expected_hash);
+            assert_eq!(metadata.size, size as u64);
+        } else {
+            panic!("expected FileAdded action");
+        }
+
+        // Verify streamed data matches.
+        let streams = cb.stream_data.lock().unwrap();
+        let received = streams.get(&expected_hash).unwrap();
+        assert_eq!(received.len(), size);
+        assert_eq!(received.as_slice(), content.as_slice());
+
+        // Verify progress events were emitted.
+        let events = cb.events.lock().unwrap();
+        let progress_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::BlobTransferProgress { .. }))
+            .collect();
+        assert!(
+            !progress_events.is_empty(),
+            "should emit progress events for large file"
+        );
+    }
+
+    #[test]
+    fn test_add_file_streaming_rejects_duplicate() {
+        let (mut engine, _cb, folder_id) = make_engine_with_folder("NAS");
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("dup.txt");
+        std::fs::write(&file_path, b"content").unwrap();
+
+        engine
+            .add_file_streaming(folder_id, "dup.txt", &file_path)
+            .unwrap();
+
+        // Second add at same path should fail.
+        let result = engine.add_file_streaming(folder_id, "dup.txt", &file_path);
+        assert!(matches!(result, Err(EngineError::FileAlreadyExists(_))));
+    }
+
+    #[test]
+    fn test_add_file_streaming_rejects_read_only() {
+        let (mut engine, _cb, folder_id) = make_engine_with_folder("NAS");
+
+        // Unsubscribe and resubscribe as ReadOnly.
+        engine.unsubscribe_folder(folder_id).unwrap();
+        engine
+            .subscribe_folder(folder_id, SyncMode::ReadOnly)
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("readonly.txt");
+        std::fs::write(&file_path, b"content").unwrap();
+
+        let result = engine.add_file_streaming(folder_id, "readonly.txt", &file_path);
+        assert!(matches!(result, Err(EngineError::ReadOnlyFolder(_))));
+    }
+
+    #[test]
+    fn test_add_file_streaming_nonexistent_file() {
+        let (mut engine, _cb, folder_id) = make_engine_with_folder("NAS");
+
+        let result =
+            engine.add_file_streaming(folder_id, "ghost.txt", std::path::Path::new("/nonexistent"));
+        assert!(matches!(result, Err(EngineError::Io(_))));
+    }
+
+    #[test]
+    fn test_add_file_streaming_nonexistent_folder() {
+        let (mut engine, _cb) = make_engine("NAS");
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, b"content").unwrap();
+
+        let fake_folder = FolderId::from_data(b"nonexistent");
+        let result = engine.add_file_streaming(fake_folder, "test.txt", &file_path);
+        assert!(matches!(result, Err(EngineError::FolderNotFound(_))));
+    }
+
+    #[test]
+    fn test_add_file_streaming_emits_file_synced_event() {
+        let (mut engine, cb, folder_id) = make_engine_with_folder("NAS");
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("event.txt");
+        std::fs::write(&file_path, b"event content").unwrap();
+
+        engine
+            .add_file_streaming(folder_id, "event.txt", &file_path)
+            .unwrap();
+
+        let events = cb.events.lock().unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            EngineEvent::FileSynced {
+                path,
+                ..
+            } if path == "event.txt"
+        )));
+    }
+
+    #[test]
+    fn test_add_file_streaming_small_file_no_chunk_overhead() {
+        // Small file (<4 MiB) still works correctly via streaming.
+        let (mut engine, cb, folder_id) = make_engine_with_folder("NAS");
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"small";
+        let file_path = dir.path().join("small.txt");
+        std::fs::write(&file_path, content).unwrap();
+
+        engine
+            .add_file_streaming(folder_id, "small.txt", &file_path)
+            .unwrap();
+
+        let hash = BlobHash::from_data(content);
+        let starts = cb.stream_starts.lock().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].1, content.len() as u64);
+
+        // Data arrives intact regardless of size.
+        let streams = cb.stream_data.lock().unwrap();
+        assert_eq!(streams.get(&hash).unwrap().as_slice(), content);
     }
 }

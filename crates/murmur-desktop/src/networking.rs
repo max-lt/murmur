@@ -401,6 +401,7 @@ async fn handle_gossip_message(
                         total_chunks,
                         "serving blob in chunks (desktop)"
                     );
+                    let data_len = data.len() as u64;
                     for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
                         let msg = GossipMessage {
                             nonce: rand::random(),
@@ -409,6 +410,7 @@ async fn handle_gossip_message(
                                 blob_hash,
                                 chunk_index: i as u32,
                                 total_chunks,
+                                total_size: data_len,
                                 data: chunk.to_vec(),
                             },
                         };
@@ -465,6 +467,7 @@ async fn handle_gossip_message(
             blob_hash,
             chunk_index,
             total_chunks,
+            total_size: _,
             data,
         } => {
             debug!(
@@ -506,6 +509,9 @@ async fn handle_gossip_message(
                     );
                 }
             }
+        }
+        GossipPayload::BlobChunkAck { .. } => {
+            // Ack handling for future point-to-point transfers.
         }
     }
 }

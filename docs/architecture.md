@@ -103,19 +103,25 @@ platforms/
 
 All shared types, identifiers, and the hybrid logical clock.
 
-| Type                  | Description                                                                             |
-| --------------------- | --------------------------------------------------------------------------------------- |
-| `DeviceId([u8; 32])`  | Ed25519 public key. Hex display. Doubles as iroh `NodeId`.                              |
-| `BlobHash([u8; 32])`  | blake3 hash of file content. Used for content-addressing and dedup.                     |
-| `NetworkId([u8; 32])` | blake3(hkdf(seed, "murmur/network-id")). Identifies the private network.                |
-| `DeviceRole`          | `Source` (produces files), `Backup` (stores files), `Full` (both).                      |
-| `DeviceInfo`          | Device metadata: ID, name, role, approval status, join timestamp.                       |
-| `FileMetadata`        | File metadata: blob hash, filename, size, MIME type, origin device.                     |
-| `AccessGrant`         | Scoped, time-limited access from one device to another. Signed by grantor.              |
-| `AccessScope`         | `AllFiles`, `FilesByPrefix(String)`, `SingleFile(BlobHash)`.                            |
-| `Action`              | 10-variant enum covering device management, file sync, access control, DAG maintenance. |
-| `HybridClock`         | Monotonic timestamp combining wall clock and logical counter. Thread-safe (AtomicU64).  |
-| `GossipPayload`       | Envelope for gossip messages (DAG entries, membership events).                          |
+| Type                  | Description                                                                                                              |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `DeviceId([u8; 32])`  | Ed25519 public key. Hex display. Doubles as iroh `NodeId`.                                                               |
+| `BlobHash([u8; 32])`  | blake3 hash of file content. `from_data()` for in-memory, `from_reader()` for streaming (64 KiB buffers).                |
+| `NetworkId([u8; 32])` | blake3(hkdf(seed, "murmur/network-id")). Identifies the private network.                                                 |
+| `FolderId([u8; 32])`  | blake3(created_at ‖ created_by ‖ name). Unique folder identifier.                                                        |
+| `SharedFolder`        | Folder metadata: folder_id, name, created_by, created_at.                                                                |
+| `SyncMode`            | `ReadWrite` or `ReadOnly`. Per-device, per-folder subscription mode.                                                     |
+| `FolderSubscription`  | A device's subscription to a folder: folder_id, device_id, mode.                                                         |
+| `DeviceRole`          | `Source` (produces files), `Backup` (stores files), `Full` (both).                                                       |
+| `DeviceInfo`          | Device metadata: ID, name, role, approval status, join timestamp.                                                        |
+| `FileMetadata`        | File metadata: blob hash, folder_id, path (relative to folder root), size, MIME type, created_at, modified_at, origin.   |
+| `ConflictInfo`        | Detected conflict: folder_id, path, competing versions, detection timestamp.                                             |
+| `ConflictVersion`     | One side of a conflict: blob_hash, device_id, hlc, dag_entry_hash.                                                      |
+| `AccessGrant`         | Scoped, time-limited access from one device to another. Signed by grantor.                                               |
+| `AccessScope`         | `AllFiles`, `FilesByPrefix(String)`, `SingleFile(BlobHash)`.                                                             |
+| `Action`              | 16-variant enum covering device management, folders, file sync, conflicts, access control, DAG maintenance.              |
+| `HybridClock`         | Monotonic timestamp combining wall clock and logical counter. Thread-safe (AtomicU64).                                   |
+| `GossipPayload`       | Envelope for gossip messages (DAG entries, blob transfer, membership events). Includes `BlobChunk` and `BlobChunkAck`.   |
 
 ### murmur-seed
 
@@ -148,11 +154,16 @@ Signed append-only DAG, adapted from Shoal's LogTree. **In-memory only** — the
 - `apply_sync_entries()` — batch receive with topological ordering
 - `compute_delta(remote_tips)` — Kahn's algorithm to find entries the remote is missing
 - `maybe_merge()` — auto-merge when multiple tips exist
+- `is_ancestor(a, b)` — BFS through parent chain for conflict detection
 
 **MaterializedState** — derived cache rebuilt by replaying DAG entries in topological order:
 
 - `devices: BTreeMap<DeviceId, DeviceInfo>` — peer list
-- `files: BTreeMap<BlobHash, FileMetadata>` — file index
+- `files: BTreeMap<(FolderId, String), FileMetadata>` — file index keyed by (folder, path)
+- `folders: BTreeMap<FolderId, SharedFolder>` — shared folders
+- `subscriptions: BTreeMap<(FolderId, DeviceId), FolderSubscription>` — per-device folder subscriptions
+- `file_versions: BTreeMap<(FolderId, String), Vec<(BlobHash, u64)>>` — version chain per (folder, path)
+- `conflicts: Vec<ConflictInfo>` — active file conflicts (concurrent edits detected by ancestry check)
 - `grants: Vec<AccessGrant>` — active access grants
 
 ### murmur-net
@@ -182,8 +193,8 @@ iroh QUIC transport, gossip broadcast, and shared wire utilities.
 **Wire utilities** (`wire` module) — shared by `murmurd` and `murmur-ffi`:
 
 - `compress_wire()` / `decompress_wire()` — deflate compression with 1-byte flag prefix (0=raw, 1=compressed). Only compresses payloads ≥256 bytes and only if compression saves space.
-- `ChunkBuffer` — reassembly buffer for chunked blob transfers (blobs >4 MB split into 1 MB chunks)
-- Constants: `CHUNK_THRESHOLD` (4 MB), `CHUNK_SIZE` (1 MB), `COMPRESS_THRESHOLD` (256 bytes)
+- `ChunkBuffer` — reassembly buffer for chunked blob transfers (blobs >4 MiB split into 1 MiB chunks)
+- Constants: `CHUNK_THRESHOLD` (4 MiB), `CHUNK_SIZE` (1 MiB), `COMPRESS_THRESHOLD` (256 bytes), `MAX_BLOB_SIZE` (1 TiB advisory — no hard limit, streaming transfers handle arbitrarily large files)
 
 ### murmur-engine
 
@@ -193,18 +204,27 @@ The orchestrator tying DAG, network, and platform together. Storage-agnostic.
 
 - `create_network()` / `join_network()` — network lifecycle
 - `approve_device()` / `revoke_device()` / `list_devices()` / `pending_requests()` — device management
-- `add_file()` — file sync with dedup
+- `add_file()` — file sync with dedup (loads full file in memory)
+- `add_file_streaming(folder_id, path, file_path)` — streaming file sync from disk (two-pass: hash then stream, bounded memory). DAG entry is created only after blob is fully stored.
+- `modify_file()` / `delete_file()` — file mutation with version tracking
+- `create_folder()` / `remove_folder()` / `subscribe_folder()` / `unsubscribe_folder()` — folder management
+- `list_folders()` / `folder_files()` / `folder_subscriptions()` / `file_history()` — folder queries
+- `list_conflicts()` / `list_conflicts_in_folder()` / `resolve_conflict()` — conflict management
 - `request_access()` / `handle_access_request()` — access control
 - `compute_delta()` / `receive_sync_entries()` — DAG synchronization
 
 **PlatformCallbacks** trait (implemented by each platform):
 
 - `on_dag_entry(entry_bytes)` — persist a new DAG entry
-- `on_blob_received(blob_hash, data)` — store a received blob
+- `on_blob_received(blob_hash, data)` — store a received blob (small blobs)
 - `on_blob_needed(blob_hash) → Option<Vec<u8>>` — retrieve a stored blob
 - `on_event(event)` — notify the UI/platform of engine events
+- `on_blob_stream_start(blob_hash, total_size)` — prepare for streaming receive (e.g., create temp file)
+- `on_blob_chunk(blob_hash, offset, data)` — receive a chunk of streaming blob
+- `on_blob_stream_complete(blob_hash) → Result<(), String>` — verify and finalize streaming blob
+- `on_blob_stream_abort(blob_hash)` — clean up aborted streaming transfer
 
-**EngineEvent** — 9 variants: `DeviceJoinRequested`, `DeviceApproved`, `DeviceRevoked`, `FileSynced`, `BlobReceived`, `AccessRequested`, `AccessGranted`, `DagSynced`, `NetworkCreated`, `NetworkJoined`.
+**EngineEvent** — 15 variants: `DeviceJoinRequested`, `DeviceApproved`, `DeviceRevoked`, `FolderCreated`, `FolderSubscribed`, `FileSynced`, `FileModified`, `BlobReceived`, `AccessRequested`, `AccessGranted`, `DagSynced`, `NetworkCreated`, `NetworkJoined`, `BlobTransferProgress`, `ConflictDetected`.
 
 ### murmur-ffi
 
@@ -243,8 +263,10 @@ Headless daemon for NAS, Raspberry Pi, or VPS. Pure daemon — no subcommands, m
 - On first run (no config): auto-initializes — generates mnemonic, writes `config.toml`, prints mnemonic
 - Config: `~/.murmur/config.toml` (device name, role, storage paths)
 - Storage: Fjall for DAG persistence, content-addressed filesystem for blobs
-- Startup: load all DAG entries from Fjall → feed into engine → start gossip networking → listen on Unix socket
-- **Gossip networking**: creates an iroh endpoint, subscribes to a gossip topic derived from the network ID. Creator uses a deterministic iroh key (HKDF from mnemonic); joining devices use a random key and bootstrap with the creator's endpoint ID. DAG entries broadcast via gossip with deflate compression (shared wire format from `murmur-net`). On `NeighborUp`, peers exchange `DagSyncRequest` with their tips and receive only the delta. When a `FileAdded` entry arrives, the daemon requests missing blobs via `BlobRequest`/`BlobResponse`; large blobs (>4 MB) use chunked transfer via `BlobChunk` messages.
+- Startup: load all DAG entries from Fjall → feed into engine → clean up stale streaming temp files → start gossip networking → listen on Unix socket
+- **Gossip networking**: creates an iroh endpoint, subscribes to a gossip topic derived from the network ID. Creator uses a deterministic iroh key (HKDF from mnemonic); joining devices use a random key and bootstrap with the creator's endpoint ID. DAG entries broadcast via gossip with deflate compression (shared wire format from `murmur-net`). On `NeighborUp`, peers exchange `DagSyncRequest` with their tips and receive only the delta. When a `FileAdded` entry arrives, the daemon requests missing blobs via `BlobRequest`/`BlobResponse`; large blobs (>4 MiB) use chunked transfer via `BlobChunk` messages with 5ms pacing between chunks.
+- **Streaming blob storage**: incoming `BlobChunk` messages are written directly to a temp file (`~/.murmur/blobs/.tmp/`) instead of being reassembled in memory. On completion, streaming blake3 verification runs without loading the full file. For unencrypted blobs, atomic rename to final path. For encrypted blobs, chunked AEAD encryption (1 MiB chunks, per-chunk derived nonces, MCv1 format) keeps memory bounded.
+- **Blob encryption at rest**: AES-256-GCM. Legacy blobs use single-nonce format (12-byte nonce + ciphertext). Streaming blobs use chunked MCv1 format (magic header + base nonce + per-chunk nonces derived via XOR). Both formats are transparently handled on read.
 - **IPC socket**: accepts `CliRequest` from `murmur-cli`, produces `CliResponse`. Handles concurrent connections. Socket cleaned up on graceful shutdown; stale sockets detected and removed on startup.
 - Signal handling: graceful shutdown on SIGTERM/SIGINT
 
@@ -267,23 +289,25 @@ iced 0.14 GUI desktop app for linux desktops.
 Every platform must provide:
 
 1. **Load** — feed persisted DAG entries into the engine on startup
-2. **Callbacks** — persist new DAG entries and blobs when the engine produces them
+2. **Callbacks** — persist new DAG entries and blobs when the engine produces them (including streaming callbacks for large files: `on_blob_stream_start`, `on_blob_chunk`, `on_blob_stream_complete`, `on_blob_stream_abort`)
 3. **User decisions** — approve/reject device join requests, access requests
 
 The engine provides:
 
-1. **Serialized data** — DagEntry bytes, blob bytes to persist
-2. **Events** — device joined, file synced, access requested, etc.
-3. **Functions** — add file, approve device, request access, etc.
+1. **Serialized data** — DagEntry bytes, blob bytes (or streaming chunks) to persist
+2. **Events** — device joined, file synced, conflict detected, access requested, etc.
+3. **Functions** — add file (in-memory or streaming), manage folders, resolve conflicts, approve devices, etc.
 
 ### Desktop (murmurd + murmur-desktop)
 
-| Concern         | Implementation                                             |
-| --------------- | ---------------------------------------------------------- |
-| DAG persistence | Fjall v3 (embedded key-value store)                        |
-| Blob storage    | Content-addressed filesystem (`~/.murmur/blobs/ab/cd/...`) |
-| Config          | TOML file (`~/.murmur/config.toml`)                        |
-| UI              | CLI (murmurd) or iced GUI (murmur-desktop)                 |
+| Concern          | Implementation                                                                              |
+| ---------------- | ------------------------------------------------------------------------------------------- |
+| DAG persistence  | Fjall v3 (embedded key-value store)                                                         |
+| Blob storage     | Content-addressed filesystem (`~/.murmur/blobs/ab/cd/...`)                                  |
+| Blob encryption  | AES-256-GCM at rest (single-nonce for small blobs, chunked MCv1 AEAD for streaming blobs)   |
+| Streaming blobs  | Temp dir (`~/.murmur/blobs/.tmp/`), streaming blake3 verify, atomic rename on complete       |
+| Config           | TOML file (`~/.murmur/config.toml`)                                                         |
+| UI               | murmur-cli (via IPC) or iced GUI (murmur-desktop)                                           |
 
 ### Android
 
@@ -319,13 +343,19 @@ DagEntry {
     signature_s: [u8; 32],
 }
 
-// Actions (10 variants)
+// Actions (16 variants)
 Action::DeviceJoinRequest { device_id, name }
 Action::DeviceApproved { device_id, role }
 Action::DeviceRevoked { device_id }
 Action::DeviceNameChanged { device_id, name }
+Action::FolderCreated { folder }
+Action::FolderRemoved { folder_id }
+Action::FolderSubscribed { folder_id, device_id, mode }
+Action::FolderUnsubscribed { folder_id, device_id }
 Action::FileAdded { metadata }
-Action::FileDeleted { blob_hash }
+Action::FileModified { folder_id, path, old_hash, new_hash, metadata }
+Action::FileDeleted { folder_id, path }
+Action::ConflictResolved { folder_id, path, chosen_hash, discarded_hashes }
 Action::AccessGranted { grant }
 Action::AccessRevoked { to }
 Action::Merge

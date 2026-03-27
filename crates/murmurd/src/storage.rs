@@ -16,6 +16,35 @@ const DAG_KEYSPACE: &str = "dag_entries";
 /// The keyspace name for the blob push queue.
 const PUSH_QUEUE_KEYSPACE: &str = "push_queue";
 
+/// Chunk size for streaming encryption (1 MiB).
+const ENCRYPT_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Magic header identifying the chunked encrypted blob format.
+///
+/// On-disk layout:
+/// ```text
+/// [4 bytes] magic: b"MCv1"
+/// [12 bytes] base_nonce
+/// [4 bytes] chunk_count: u32 LE
+/// Per chunk:
+///   [4 bytes] ciphertext_len: u32 LE (plaintext + 16-byte GCM tag)
+///   [ciphertext_len bytes] ciphertext
+/// ```
+const CHUNKED_ENCRYPT_MAGIC: &[u8; 4] = b"MCv1";
+
+/// Derive a per-chunk nonce by XOR-ing the chunk index into the base nonce.
+///
+/// This ensures each chunk gets a unique nonce for AES-256-GCM, which is
+/// required for security (nonce reuse completely breaks GCM).
+fn derive_chunk_nonce(base_nonce: &[u8; 12], chunk_index: u32) -> [u8; 12] {
+    let mut nonce = *base_nonce;
+    let index_bytes = chunk_index.to_le_bytes();
+    for (i, b) in index_bytes.iter().enumerate() {
+        nonce[i] ^= b;
+    }
+    nonce
+}
+
 /// Persistent storage backed by Fjall (DAG) and filesystem (blobs).
 pub struct Storage {
     /// Fjall database.
@@ -141,14 +170,20 @@ impl Storage {
             let raw = std::fs::read(&path).context("read blob")?;
 
             let data = if let Some(ref cipher) = self.blob_cipher {
-                if raw.len() < 12 {
-                    anyhow::bail!("encrypted blob too short (missing nonce)");
+                if raw.len() >= 4 && raw[..4] == *CHUNKED_ENCRYPT_MAGIC {
+                    // Chunked encrypted format (MCv1).
+                    Self::decrypt_chunked(cipher, &raw)?
+                } else {
+                    // Legacy single-nonce format.
+                    if raw.len() < 12 {
+                        anyhow::bail!("encrypted blob too short (missing nonce)");
+                    }
+                    let (nonce_bytes, ciphertext) = raw.split_at(12);
+                    let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
+                    cipher
+                        .decrypt(nonce, ciphertext)
+                        .map_err(|e| anyhow::anyhow!("blob decryption failed: {e}"))?
                 }
-                let (nonce_bytes, ciphertext) = raw.split_at(12);
-                let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
-                cipher
-                    .decrypt(nonce, ciphertext)
-                    .map_err(|e| anyhow::anyhow!("blob decryption failed: {e}"))?
             } else {
                 raw
             };
@@ -316,6 +351,209 @@ impl Storage {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Streaming blob storage
+    // -----------------------------------------------------------------------
+
+    /// Directory for in-progress streaming blob transfers.
+    fn stream_tmp_dir(&self) -> std::path::PathBuf {
+        self.blob_dir.join(".tmp")
+    }
+
+    /// Temp file path for a streaming transfer in progress.
+    fn stream_tmp_path(&self, blob_hash: BlobHash) -> std::path::PathBuf {
+        self.stream_tmp_dir().join(blob_hash.to_string())
+    }
+
+    /// Start a streaming blob transfer (create temp file).
+    pub fn stream_start(&self, blob_hash: BlobHash, _total_size: u64) -> Result<()> {
+        let tmp_dir = self.stream_tmp_dir();
+        std::fs::create_dir_all(&tmp_dir).context("create stream tmp dir")?;
+        let tmp_path = self.stream_tmp_path(blob_hash);
+        std::fs::File::create(&tmp_path).context("create stream tmp file")?;
+        debug!(%blob_hash, "streaming blob transfer started");
+        Ok(())
+    }
+
+    /// Append a chunk to a streaming transfer.
+    pub fn stream_chunk(&self, blob_hash: BlobHash, offset: u64, data: &[u8]) -> Result<()> {
+        use std::io::{Seek, Write};
+        let tmp_path = self.stream_tmp_path(blob_hash);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp_path)
+            .context("open stream tmp file for chunk write")?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .context("seek in stream tmp file")?;
+        file.write_all(data).context("write chunk to stream tmp")?;
+        Ok(())
+    }
+
+    /// Complete a streaming transfer: verify hash and finalize storage.
+    ///
+    /// For unencrypted blobs, renames the temp file to the final content-addressed
+    /// path. For encrypted blobs, reads the temp file, encrypts, writes to final
+    /// path, then removes the temp file.
+    pub fn stream_complete(&self, blob_hash: BlobHash) -> Result<()> {
+        let tmp_path = self.stream_tmp_path(blob_hash);
+
+        // Streaming hash verification (never loads entire file into memory).
+        let file = std::fs::File::open(&tmp_path).context("open stream tmp for verification")?;
+        let actual = BlobHash::from_reader(file).context("streaming hash verification")?;
+        if actual != blob_hash {
+            std::fs::remove_file(&tmp_path).ok();
+            anyhow::bail!(
+                "streaming blob integrity check failed: expected {blob_hash}, got {actual}"
+            );
+        }
+
+        let final_path = self.blob_path(blob_hash);
+        if let Some(parent) = final_path.parent() {
+            std::fs::create_dir_all(parent).context("create blob parent dir")?;
+        }
+
+        if let Some(ref cipher) = self.blob_cipher {
+            // Chunked streaming encryption: read and encrypt in ENCRYPT_CHUNK_SIZE
+            // blocks, each with its own derived nonce. Memory stays bounded at
+            // ~1 MiB regardless of file size.
+            use std::io::{BufReader, Read, Write};
+
+            let file = std::fs::File::open(&tmp_path).context("open stream tmp for encryption")?;
+            let file_size = file.metadata().context("stream tmp metadata")?.len();
+            let mut reader = BufReader::with_capacity(ENCRYPT_CHUNK_SIZE, file);
+
+            let total_chunks = if file_size == 0 {
+                0u32
+            } else {
+                file_size.div_ceil(ENCRYPT_CHUNK_SIZE as u64) as u32
+            };
+            let base_nonce_generic = Aes256Gcm::generate_nonce(&mut OsRng);
+            let base_nonce: [u8; 12] = base_nonce_generic.into();
+
+            let mut out_file =
+                std::fs::File::create(&final_path).context("create encrypted blob file")?;
+
+            // Write header: magic + base_nonce + chunk_count.
+            out_file
+                .write_all(CHUNKED_ENCRYPT_MAGIC)
+                .context("write chunked magic")?;
+            out_file
+                .write_all(&base_nonce)
+                .context("write chunked base nonce")?;
+            out_file
+                .write_all(&total_chunks.to_le_bytes())
+                .context("write chunked chunk count")?;
+
+            let mut buf = vec![0u8; ENCRYPT_CHUNK_SIZE];
+            let mut chunk_index: u32 = 0;
+
+            loop {
+                // Fill the buffer (may require multiple reads).
+                let mut n = 0;
+                while n < ENCRYPT_CHUNK_SIZE {
+                    let bytes_read = reader
+                        .read(&mut buf[n..])
+                        .context("read stream tmp chunk for encryption")?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    n += bytes_read;
+                }
+                if n == 0 {
+                    break;
+                }
+
+                let chunk_nonce = derive_chunk_nonce(&base_nonce, chunk_index);
+                let nonce = aes_gcm::Nonce::from(chunk_nonce);
+                let ciphertext = cipher
+                    .encrypt(&nonce, &buf[..n])
+                    .map_err(|e| anyhow::anyhow!("chunk {chunk_index} encryption failed: {e}"))?;
+
+                let ct_len = ciphertext.len() as u32;
+                out_file
+                    .write_all(&ct_len.to_le_bytes())
+                    .context("write chunk ciphertext length")?;
+                out_file
+                    .write_all(&ciphertext)
+                    .context("write chunk ciphertext")?;
+
+                chunk_index += 1;
+            }
+
+            std::fs::remove_file(&tmp_path).ok();
+        } else {
+            // Unencrypted: atomic rename.
+            std::fs::rename(&tmp_path, &final_path).context("rename stream tmp to final")?;
+        }
+
+        debug!(%blob_hash, "streaming blob transfer complete");
+        Ok(())
+    }
+
+    /// Abort a streaming transfer (clean up temp file).
+    pub fn stream_abort(&self, blob_hash: BlobHash) {
+        let tmp_path = self.stream_tmp_path(blob_hash);
+        if tmp_path.exists() {
+            std::fs::remove_file(&tmp_path).ok();
+            debug!(%blob_hash, "streaming blob transfer aborted, temp cleaned up");
+        }
+    }
+
+    /// Clean up any stale temp files from interrupted transfers.
+    pub fn clean_stream_tmp(&self) -> Result<()> {
+        let tmp_dir = self.stream_tmp_dir();
+        if tmp_dir.exists() {
+            let mut count = 0u64;
+            for entry in std::fs::read_dir(&tmp_dir).context("read stream tmp dir")? {
+                let entry = entry.context("read stream tmp entry")?;
+                if entry.path().is_file() {
+                    std::fs::remove_file(entry.path()).ok();
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                info!(count, "cleaned up stale streaming temp files");
+            }
+        }
+        Ok(())
+    }
+
+    /// Decrypt a chunked encrypted blob (MCv1 format).
+    fn decrypt_chunked(cipher: &Aes256Gcm, raw: &[u8]) -> Result<Vec<u8>> {
+        // Header: 4 (magic) + 12 (base_nonce) + 4 (chunk_count) = 20 bytes.
+        if raw.len() < 20 {
+            anyhow::bail!("chunked encrypted blob too short for header");
+        }
+        let base_nonce: [u8; 12] = raw[4..16].try_into().unwrap();
+        let chunk_count = u32::from_le_bytes(raw[16..20].try_into().unwrap());
+
+        let mut offset = 20usize;
+        let mut plaintext = Vec::new();
+
+        for i in 0..chunk_count {
+            if offset + 4 > raw.len() {
+                anyhow::bail!("chunked encrypted blob truncated at chunk {i} length");
+            }
+            let ct_len = u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+
+            if offset + ct_len > raw.len() {
+                anyhow::bail!("chunked encrypted blob truncated at chunk {i} data");
+            }
+            let ciphertext = &raw[offset..offset + ct_len];
+            offset += ct_len;
+
+            let chunk_nonce = derive_chunk_nonce(&base_nonce, i);
+            let nonce = aes_gcm::Nonce::from(chunk_nonce);
+            let chunk_plaintext = cipher
+                .decrypt(&nonce, ciphertext)
+                .map_err(|e| anyhow::anyhow!("chunk {i} decryption failed: {e}"))?;
+            plaintext.extend_from_slice(&chunk_plaintext);
+        }
+
+        Ok(plaintext)
+    }
+
     /// Content-addressed blob path: `blob_dir/ab/cd/<full_hex>`.
     fn blob_path(&self, blob_hash: BlobHash) -> std::path::PathBuf {
         let hex = blob_hash.to_string();
@@ -370,6 +608,28 @@ impl murmur_engine::PlatformCallbacks for FjallPlatform {
 
     fn on_event(&self, event: murmur_engine::EngineEvent) {
         info!(?event, "engine event");
+    }
+
+    fn on_blob_stream_start(&self, blob_hash: BlobHash, total_size: u64) {
+        if let Err(e) = self.storage.stream_start(blob_hash, total_size) {
+            tracing::error!(error = %e, %blob_hash, "failed to start streaming blob");
+        }
+    }
+
+    fn on_blob_chunk(&self, blob_hash: BlobHash, offset: u64, data: &[u8]) {
+        if let Err(e) = self.storage.stream_chunk(blob_hash, offset, data) {
+            tracing::error!(error = %e, %blob_hash, offset, "failed to write blob chunk");
+        }
+    }
+
+    fn on_blob_stream_complete(&self, blob_hash: BlobHash) -> Result<(), String> {
+        self.storage
+            .stream_complete(blob_hash)
+            .map_err(|e| e.to_string())
+    }
+
+    fn on_blob_stream_abort(&self, blob_hash: BlobHash) {
+        self.storage.stream_abort(blob_hash);
     }
 }
 
@@ -690,6 +950,322 @@ mod tests {
         let corrupted = storage.verify_all_blobs().unwrap();
         assert_eq!(corrupted.len(), 1);
         assert_eq!(corrupted[0], hash);
+    }
+
+    // --- Streaming blob storage tests (M15) ---
+
+    #[test]
+    fn test_streaming_blob_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("db"), &dir.path().join("blobs")).unwrap();
+
+        let content = b"streaming blob test data";
+        let hash = BlobHash::from_data(content);
+
+        storage.stream_start(hash, content.len() as u64).unwrap();
+        storage.stream_chunk(hash, 0, content).unwrap();
+        storage.stream_complete(hash).unwrap();
+
+        // Blob should be loadable via normal path.
+        let loaded = storage.load_blob(hash).unwrap().unwrap();
+        assert_eq!(loaded, content);
+    }
+
+    #[test]
+    fn test_streaming_blob_multiple_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("db"), &dir.path().join("blobs")).unwrap();
+
+        let content = b"chunk_one_chunk_two_chunk_three";
+        let hash = BlobHash::from_data(content);
+
+        storage.stream_start(hash, content.len() as u64).unwrap();
+        // Write in 10-byte chunks.
+        storage.stream_chunk(hash, 0, &content[..10]).unwrap();
+        storage.stream_chunk(hash, 10, &content[10..20]).unwrap();
+        storage.stream_chunk(hash, 20, &content[20..]).unwrap();
+        storage.stream_complete(hash).unwrap();
+
+        let loaded = storage.load_blob(hash).unwrap().unwrap();
+        assert_eq!(loaded, content);
+    }
+
+    #[test]
+    fn test_streaming_blob_corruption_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("db"), &dir.path().join("blobs")).unwrap();
+
+        let content = b"original data";
+        let hash = BlobHash::from_data(content);
+
+        storage.stream_start(hash, content.len() as u64).unwrap();
+        // Write wrong data.
+        storage.stream_chunk(hash, 0, b"corrupted dat").unwrap();
+        let result = storage.stream_complete(hash);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_streaming_blob_abort_cleans_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("db"), &dir.path().join("blobs")).unwrap();
+
+        let content = b"will be aborted";
+        let hash = BlobHash::from_data(content);
+
+        storage.stream_start(hash, content.len() as u64).unwrap();
+        storage.stream_chunk(hash, 0, content).unwrap();
+
+        // Verify tmp file exists.
+        let tmp_path = dir.path().join("blobs").join(".tmp").join(hash.to_string());
+        assert!(tmp_path.exists());
+
+        // Abort.
+        storage.stream_abort(hash);
+        assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn test_streaming_blob_complete_cleans_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("db"), &dir.path().join("blobs")).unwrap();
+
+        let content = b"completed transfer";
+        let hash = BlobHash::from_data(content);
+
+        storage.stream_start(hash, content.len() as u64).unwrap();
+        storage.stream_chunk(hash, 0, content).unwrap();
+        storage.stream_complete(hash).unwrap();
+
+        // Tmp file should be gone.
+        let tmp_path = dir.path().join("blobs").join(".tmp").join(hash.to_string());
+        assert!(!tmp_path.exists());
+
+        // Blob should be at final path.
+        let loaded = storage.load_blob(hash).unwrap();
+        assert!(loaded.is_some());
+    }
+
+    #[test]
+    fn test_streaming_blob_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&dir.path().join("db"), &dir.path().join("blobs")).unwrap();
+        storage.set_blob_encryption_key(&[0x42; 32]);
+
+        let content = b"encrypted streaming data";
+        let hash = BlobHash::from_data(content);
+
+        storage.stream_start(hash, content.len() as u64).unwrap();
+        storage.stream_chunk(hash, 0, content).unwrap();
+        storage.stream_complete(hash).unwrap();
+
+        // Should decrypt correctly on load.
+        let loaded = storage.load_blob(hash).unwrap().unwrap();
+        assert_eq!(loaded, content);
+    }
+
+    #[test]
+    fn test_clean_stream_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("db"), &dir.path().join("blobs")).unwrap();
+
+        // Create a stale temp file.
+        let hash = BlobHash::from_data(b"stale");
+        storage.stream_start(hash, 5).unwrap();
+        storage.stream_chunk(hash, 0, b"stale").unwrap();
+
+        let tmp_path = dir.path().join("blobs").join(".tmp").join(hash.to_string());
+        assert!(tmp_path.exists());
+
+        storage.clean_stream_tmp().unwrap();
+        assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn test_streaming_multiple_concurrent_transfers() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("db"), &dir.path().join("blobs")).unwrap();
+
+        let content_a = b"blob alpha content here";
+        let content_b = b"blob beta different content";
+        let hash_a = BlobHash::from_data(content_a);
+        let hash_b = BlobHash::from_data(content_b);
+
+        // Start both transfers.
+        storage
+            .stream_start(hash_a, content_a.len() as u64)
+            .unwrap();
+        storage
+            .stream_start(hash_b, content_b.len() as u64)
+            .unwrap();
+
+        // Interleave chunks.
+        storage.stream_chunk(hash_a, 0, content_a).unwrap();
+        storage.stream_chunk(hash_b, 0, content_b).unwrap();
+
+        // Complete both.
+        storage.stream_complete(hash_a).unwrap();
+        storage.stream_complete(hash_b).unwrap();
+
+        // Both blobs should be loadable.
+        assert_eq!(
+            storage.load_blob(hash_a).unwrap().unwrap(),
+            content_a.to_vec()
+        );
+        assert_eq!(
+            storage.load_blob(hash_b).unwrap().unwrap(),
+            content_b.to_vec()
+        );
+    }
+
+    #[test]
+    fn test_platform_callbacks_streaming() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage =
+            Arc::new(Storage::open(&dir.path().join("db"), &dir.path().join("blobs")).unwrap());
+        let platform = FjallPlatform::new(storage.clone());
+
+        let content = b"platform streaming test";
+        let hash = BlobHash::from_data(content);
+
+        use murmur_engine::PlatformCallbacks;
+        platform.on_blob_stream_start(hash, content.len() as u64);
+        platform.on_blob_chunk(hash, 0, content);
+        let result = platform.on_blob_stream_complete(hash);
+        assert!(result.is_ok());
+
+        // Verify blob is stored.
+        let loaded = storage.load_blob(hash).unwrap().unwrap();
+        assert_eq!(loaded, content);
+    }
+
+    #[test]
+    fn test_streaming_encrypted_multi_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&dir.path().join("db"), &dir.path().join("blobs")).unwrap();
+        storage.set_blob_encryption_key(&[0x42; 32]);
+
+        // 2.5 MiB — spans 3 encryption chunks (1 MiB each, last one 0.5 MiB).
+        let size = 2 * 1024 * 1024 + 512 * 1024;
+        let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let hash = BlobHash::from_data(&content);
+
+        storage.stream_start(hash, content.len() as u64).unwrap();
+        // Stream in 256 KiB chunks (smaller than encryption chunk).
+        let write_chunk = 256 * 1024;
+        let mut offset = 0u64;
+        for chunk in content.chunks(write_chunk) {
+            storage.stream_chunk(hash, offset, chunk).unwrap();
+            offset += chunk.len() as u64;
+        }
+        storage.stream_complete(hash).unwrap();
+
+        // Verify roundtrip.
+        let loaded = storage.load_blob(hash).unwrap().unwrap();
+        assert_eq!(loaded.len(), content.len());
+        assert_eq!(loaded, content);
+
+        // Verify on-disk file uses chunked format (starts with MCv1).
+        let hex = hash.to_string();
+        let blob_path = dir
+            .path()
+            .join("blobs")
+            .join(&hex[..2])
+            .join(&hex[2..4])
+            .join(&hex);
+        let raw = std::fs::read(&blob_path).unwrap();
+        assert_eq!(&raw[..4], b"MCv1");
+    }
+
+    #[test]
+    fn test_streaming_encrypted_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&dir.path().join("db"), &dir.path().join("blobs")).unwrap();
+        storage.set_blob_encryption_key(&[0x42; 32]);
+
+        let content = b"";
+        let hash = BlobHash::from_data(content);
+
+        storage.stream_start(hash, 0).unwrap();
+        storage.stream_complete(hash).unwrap();
+
+        let loaded = storage.load_blob(hash).unwrap().unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn test_legacy_encrypted_blob_still_loads() {
+        // Blobs stored via store_blob (legacy single-nonce format) must still
+        // load correctly even after the chunked format was introduced.
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&dir.path().join("db"), &dir.path().join("blobs")).unwrap();
+        storage.set_blob_encryption_key(&[0x42; 32]);
+
+        let data = b"legacy encrypted data";
+        let hash = BlobHash::from_data(data);
+
+        // store_blob uses the old single-nonce format.
+        storage.store_blob(hash, data).unwrap();
+
+        // Verify the on-disk format is NOT chunked.
+        let hex = hash.to_string();
+        let blob_path = dir
+            .path()
+            .join("blobs")
+            .join(&hex[..2])
+            .join(&hex[2..4])
+            .join(&hex);
+        let raw = std::fs::read(&blob_path).unwrap();
+        assert_ne!(&raw[..4], b"MCv1", "store_blob should use legacy format");
+
+        // load_blob should still decrypt it correctly.
+        let loaded = storage.load_blob(hash).unwrap().unwrap();
+        assert_eq!(loaded, data);
+    }
+
+    #[test]
+    fn test_chunked_encrypted_tampered_chunk_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&dir.path().join("db"), &dir.path().join("blobs")).unwrap();
+        storage.set_blob_encryption_key(&[0x42; 32]);
+
+        let content = b"tamper test for chunked encryption";
+        let hash = BlobHash::from_data(content);
+
+        storage.stream_start(hash, content.len() as u64).unwrap();
+        storage.stream_chunk(hash, 0, content).unwrap();
+        storage.stream_complete(hash).unwrap();
+
+        // Tamper with ciphertext bytes on disk (after the header).
+        let hex = hash.to_string();
+        let blob_path = dir
+            .path()
+            .join("blobs")
+            .join(&hex[..2])
+            .join(&hex[2..4])
+            .join(&hex);
+        let mut raw = std::fs::read(&blob_path).unwrap();
+        // Flip a byte in the first chunk's ciphertext (after 4+12+4+4 = 24 byte header).
+        if raw.len() > 25 {
+            raw[25] ^= 0xff;
+        }
+        std::fs::write(&blob_path, &raw).unwrap();
+
+        let result = storage.load_blob(hash);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_derive_chunk_nonce_uniqueness() {
+        let base = [0xAA; 12];
+        let n0 = super::derive_chunk_nonce(&base, 0);
+        let n1 = super::derive_chunk_nonce(&base, 1);
+        let n2 = super::derive_chunk_nonce(&base, 2);
+        assert_ne!(n0, n1);
+        assert_ne!(n1, n2);
+        assert_ne!(n0, n2);
+        // Index 0 should leave base unchanged.
+        assert_eq!(n0, base);
     }
 
     #[test]

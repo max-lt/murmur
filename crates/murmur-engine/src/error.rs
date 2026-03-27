@@ -55,4 +55,7 @@ pub enum EngineError {
     /// Conflict not found.
     #[error("conflict not found: {0}")]
     ConflictNotFound(String),
+    /// I/O error (streaming file operations).
+    #[error("io: {0}")]
+    Io(String),
 }

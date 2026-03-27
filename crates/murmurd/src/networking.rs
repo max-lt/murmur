@@ -21,6 +21,14 @@ use crate::config::ThrottleConfig;
 use crate::metrics;
 use crate::storage::Storage;
 
+/// Maximum number of chunks in flight before waiting (backpressure).
+/// Used for future point-to-point ack-based flow control.
+#[allow(dead_code)]
+const MAX_CHUNKS_IN_FLIGHT: usize = 4;
+
+/// Delay between sending chunks for pacing (milliseconds).
+const CHUNK_PACING_MS: u64 = 5;
+
 /// Handle returned from [`start_networking`], used to broadcast entries and
 /// query connected peer count.
 pub struct NetworkHandle {
@@ -309,9 +317,10 @@ pub async fn start_networking(
                         }
                     }
                 } else {
-                    // Large blob: send in chunks, same as BlobRequest handler.
+                    // Large blob: send in chunks with pacing.
+                    let data_len = data.len() as u64;
                     let total_chunks = data.len().div_ceil(CHUNK_SIZE) as u32;
-                    info!(%blob_hash, size = data.len(), total_chunks, "push queue: sending blob in chunks");
+                    info!(%blob_hash, size = data_len, total_chunks, "push queue: sending blob in chunks");
                     let mut all_ok = true;
                     for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
                         let msg = GossipMessage {
@@ -321,6 +330,7 @@ pub async fn start_networking(
                                 blob_hash,
                                 chunk_index: i as u32,
                                 total_chunks,
+                                total_size: data_len,
                                 data: chunk.to_vec(),
                             },
                         };
@@ -328,6 +338,11 @@ pub async fn start_networking(
                             warn!(error = %e, %blob_hash, chunk = i, "push queue: chunk broadcast failed");
                             all_ok = false;
                             break;
+                        }
+                        // Pacing: yield between chunks to avoid flooding.
+                        if i + 1 < total_chunks as usize {
+                            tokio::time::sleep(std::time::Duration::from_millis(CHUNK_PACING_MS))
+                                .await;
                         }
                     }
                     if all_ok {
@@ -589,11 +604,12 @@ async fn handle_gossip_message(
                             warn!(error = %e, %blob_hash, "blob response broadcast failed");
                         }
                     } else {
-                        // Large blob: send in chunks.
+                        // Large blob: send in chunks with pacing.
+                        let data_len = data.len() as u64;
                         let total_chunks = data.len().div_ceil(CHUNK_SIZE) as u32;
                         info!(
                             %blob_hash,
-                            size = data.len(),
+                            size = data_len,
                             total_chunks,
                             "serving blob in chunks"
                         );
@@ -605,6 +621,7 @@ async fn handle_gossip_message(
                                     blob_hash,
                                     chunk_index: i as u32,
                                     total_chunks,
+                                    total_size: data_len,
                                     data: chunk.to_vec(),
                                 },
                             };
@@ -616,6 +633,13 @@ async fn handle_gossip_message(
                                     "chunk broadcast failed"
                                 );
                                 break;
+                            }
+                            // Pacing: yield between chunks.
+                            if i + 1 < total_chunks as usize {
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    CHUNK_PACING_MS,
+                                ))
+                                .await;
                             }
                         }
                     }
@@ -664,6 +688,7 @@ async fn handle_gossip_message(
             blob_hash,
             chunk_index,
             total_chunks,
+            total_size,
             data,
         } => {
             debug!(
@@ -674,39 +699,52 @@ async fn handle_gossip_message(
                 "received blob chunk"
             );
 
-            let buffer = chunk_buffers
-                .entry(blob_hash)
-                .or_insert_with(|| ChunkBuffer::new(total_chunks));
-
-            buffer.insert(chunk_index, data);
-
-            if buffer.is_complete() {
-                let buffer = chunk_buffers.remove(&blob_hash).unwrap();
-                let full_data = buffer.reassemble();
-
-                // Verify full blob hash.
-                let actual_hash = BlobHash::from_data(&full_data);
-                if actual_hash != blob_hash {
-                    warn!(
-                        expected = %blob_hash,
-                        actual = %actual_hash,
-                        "chunked blob integrity check failed"
-                    );
+            // First chunk: start streaming to temp file.
+            if let std::collections::hash_map::Entry::Vacant(entry) = chunk_buffers.entry(blob_hash)
+            {
+                if let Err(e) = storage.stream_start(blob_hash, total_size) {
+                    warn!(error = %e, %blob_hash, "failed to start streaming receive");
                     return;
                 }
+                entry.insert(ChunkBuffer::new(total_chunks));
+            }
 
-                if let Err(e) = storage.store_blob(blob_hash, &full_data) {
-                    warn!(error = %e, %blob_hash, "failed to store reassembled blob");
-                } else {
-                    metrics::record_blob_transfer_bytes("download", full_data.len() as u64);
-                    info!(
-                        %blob_hash,
-                        size = full_data.len(),
-                        chunks = total_chunks,
-                        "chunked blob reassembled and stored"
-                    );
+            // Write chunk to temp file at the correct offset.
+            let offset = chunk_index as u64 * CHUNK_SIZE as u64;
+            if let Err(e) = storage.stream_chunk(blob_hash, offset, &data) {
+                warn!(error = %e, %blob_hash, chunk = chunk_index, "failed to write chunk to temp");
+                chunk_buffers.remove(&blob_hash);
+                storage.stream_abort(blob_hash);
+                return;
+            }
+
+            // Track chunk receipt for completion detection.
+            let buffer = chunk_buffers.get_mut(&blob_hash).unwrap();
+            buffer.insert(chunk_index, vec![]); // Empty — data is on disk.
+
+            if buffer.is_complete() {
+                chunk_buffers.remove(&blob_hash);
+
+                // Complete: verify hash and finalize.
+                match storage.stream_complete(blob_hash) {
+                    Ok(()) => {
+                        metrics::record_blob_transfer_bytes("download", total_size);
+                        info!(
+                            %blob_hash,
+                            size = total_size,
+                            chunks = total_chunks,
+                            "streaming blob received and stored"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = %e, %blob_hash, "streaming blob verification/storage failed");
+                    }
                 }
             }
+        }
+        GossipPayload::BlobChunkAck { .. } => {
+            // Ack handling for future point-to-point transfers.
+            // Currently gossip doesn't require acks — pacing provides backpressure.
         }
     }
 }
