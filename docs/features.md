@@ -54,6 +54,10 @@ Need to share a specific file with another device temporarily? Access grants are
 
 Every state change — device joins, file additions, folder subscriptions, conflict resolutions — is recorded as a DAG entry that's blake3-hashed and Ed25519-signed by its author. Tampered entries are rejected. You get a complete, cryptographically verifiable audit trail of everything that happened in your network.
 
+## Full CLI Management
+
+Every feature is accessible from the command line. `murmur-cli` connects to the daemon via Unix socket and exposes folder management (create, subscribe, unsubscribe, change sync mode), conflict resolution (list conflicts, choose a version), file history (version chain for any file), transfer status, and device management. All commands support `--json` for scripting and automation. A real-time event stream lets tools subscribe to engine events as they happen.
+
 ## Pure Rust, Runs Everywhere
 
 The entire core — networking, cryptography, DAG, sync engine — is pure Rust with zero C dependencies. It cross-compiles to Android and iOS without toolchain headaches. The same code runs on a Raspberry Pi, a Linux desktop, an Android phone, and (eventually) an iPhone. Platform differences (storage, UI) are handled by a thin callback layer; the protocol logic is identical everywhere.

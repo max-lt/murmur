@@ -243,17 +243,24 @@ UniFFI 0.31 (proc-macro based) bindings exposing `murmur-engine` to mobile platf
 
 Shared IPC types for daemon ↔ CLI communication over Unix socket.
 
-- `CliRequest` — 8 variants: `Status`, `ListDevices`, `ListPending`, `ApproveDevice`, `RevokeDevice`, `ShowMnemonic`, `ListFiles`, `AddFile`
-- `CliResponse` — 7 variants: `Status`, `Devices`, `Pending`, `Mnemonic`, `Files`, `Ok`, `Error`
+- `CliRequest` — 21 variants covering: device management (`Status`, `ListDevices`, `ListPending`, `ApproveDevice`, `RevokeDevice`, `ShowMnemonic`), file operations (`ListFiles`, `AddFile`, `TransferStatus`), folder management (`CreateFolder`, `RemoveFolder`, `ListFolders`, `SubscribeFolder`, `UnsubscribeFolder`, `FolderFiles`, `FolderStatus`, `SetFolderMode`), conflict resolution (`ListConflicts`, `ResolveConflict`), file history (`FileHistory`), event streaming (`SubscribeEvents`)
+- `CliResponse` — 13 variants: `Status`, `Devices`, `Pending`, `Mnemonic`, `Files`, `TransferStatus`, `Folders`, `FolderStatus`, `Conflicts`, `FileVersions`, `Event`, `Ok`, `Error`
+- IPC data types: `DeviceInfoIpc`, `FileInfoIpc`, `TransferInfoIpc`, `FolderInfoIpc`, `ConflictInfoIpc`, `ConflictVersionIpc`, `FileVersionIpc`, `EngineEventIpc`
 - `socket_path()` — resolves to `~/.murmur/murmurd.sock`
 - Wire format: length-prefixed postcard over Unix socket
+- Event streaming: `SubscribeEvents` request opens a long-lived connection; server pushes `Event` responses via `tokio::sync::broadcast` as engine events occur
 
 ### murmur-cli
 
 CLI tool for managing a running `murmurd` instance.
 
 - **Offline commands** (no daemon required): `join <mnemonic> [--name NAME]`
-- **Online commands** (connects to daemon via Unix socket): `status`, `devices`, `pending`, `approve`, `revoke`, `mnemonic`, `files`, `add`
+- **Online commands** (connects to daemon via Unix socket):
+  - Device management: `status`, `devices`, `pending`, `approve`, `revoke`, `mnemonic`
+  - File operations: `files`, `add`, `transfers`
+  - Folder management: `folder create`, `folder list`, `folder subscribe`, `folder unsubscribe`, `folder files`, `folder status`, `folder remove`, `folder mode`
+  - Conflict resolution: `conflicts [--folder ID]`, `resolve`
+  - File history: `history`
 - Output: plain text by default, `--json` flag for machine-readable output
 
 ### murmurd
@@ -271,7 +278,8 @@ Headless daemon for NAS, Raspberry Pi, or VPS. Pure daemon — no subcommands, m
 - **Bidirectional sync** (`sync` module): Forward sync translates filesystem events into engine operations (`add_file_streaming`, `modify_file`, `delete_file`). Reverse sync writes files to disk when `FileSynced`, `FileModified`, or `FileDeleted` events arrive from the network. Initial scan on startup reconciles local directory state with the DAG.
 - **Ignore patterns** (`ignore` module): `IgnoreFilter` wraps the `ignore` crate for gitignore-style pattern matching. Each folder supports a `.murmurignore` file. Built-in defaults always exclude: `.DS_Store`, `Thumbs.db`, `._*`, `*.tmp`, `*~`, `.murmurignore`, `*.conflict-*`.
 - **Folder config**: `[[folders]]` array in `config.toml` maps folder IDs to local directories with sync mode (`read-write` or `read-only`).
-- **IPC socket**: accepts `CliRequest` from `murmur-cli`, produces `CliResponse`. Handles concurrent connections. Socket cleaned up on graceful shutdown; stale sockets detected and removed on startup.
+- **IPC socket**: accepts `CliRequest` from `murmur-cli`, produces `CliResponse`. Handles concurrent connections. Socket cleaned up on graceful shutdown; stale sockets detected and removed on startup. Supports all 21 request types including folder management, conflict resolution, file history, and transfer status.
+- **Event streaming**: `SubscribeEvents` opens a long-lived IPC connection. Engine events are broadcast via `tokio::sync::broadcast` channel to all subscribers, enabling real-time UI updates in the desktop app and web dashboard.
 - Signal handling: graceful shutdown on SIGTERM/SIGINT
 
 ### murmur-desktop

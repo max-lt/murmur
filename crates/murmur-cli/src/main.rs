@@ -77,6 +77,83 @@ enum Command {
     },
     /// Show in-flight blob transfer status.
     Transfers,
+    /// Folder management commands.
+    #[command(subcommand)]
+    Folder(FolderCommand),
+    /// List active file conflicts.
+    Conflicts {
+        /// Filter by folder ID (optional).
+        #[arg(long)]
+        folder: Option<String>,
+    },
+    /// Resolve a file conflict.
+    Resolve {
+        /// Folder ID (64-character hex).
+        folder_id: String,
+        /// File path within the folder.
+        path: String,
+        /// Blob hash of the chosen version (64-character hex).
+        chosen_hash: String,
+    },
+    /// Show version history for a file.
+    History {
+        /// Folder ID (64-character hex).
+        folder_id: String,
+        /// File path within the folder.
+        path: String,
+    },
+}
+
+/// Folder management subcommands.
+#[derive(Subcommand)]
+enum FolderCommand {
+    /// Create a new shared folder.
+    Create {
+        /// Folder name.
+        name: String,
+    },
+    /// List all shared folders.
+    List,
+    /// Subscribe to a folder.
+    Subscribe {
+        /// Folder ID (64-character hex).
+        folder_id: String,
+        /// Local directory path for the folder's files.
+        local_path: String,
+        /// Subscribe as read-only.
+        #[arg(long)]
+        read_only: bool,
+    },
+    /// Unsubscribe from a folder.
+    Unsubscribe {
+        /// Folder ID (64-character hex).
+        folder_id: String,
+        /// Keep local files after unsubscribing.
+        #[arg(long)]
+        keep_local: bool,
+    },
+    /// List files in a folder.
+    Files {
+        /// Folder ID (64-character hex).
+        folder_id: String,
+    },
+    /// Show folder status.
+    Status {
+        /// Folder ID (64-character hex).
+        folder_id: String,
+    },
+    /// Remove a shared folder.
+    Remove {
+        /// Folder ID (64-character hex).
+        folder_id: String,
+    },
+    /// Change sync mode for a folder.
+    Mode {
+        /// Folder ID (64-character hex).
+        folder_id: String,
+        /// New mode: read-write or read-only.
+        mode: String,
+    },
 }
 
 fn main() {
@@ -109,24 +186,7 @@ fn run_online(base_dir: &std::path::Path, command: Command, json: bool) -> Resul
         )
     })?;
 
-    let request = match command {
-        Command::Status => CliRequest::Status,
-        Command::Devices => CliRequest::ListDevices,
-        Command::Pending => CliRequest::ListPending,
-        Command::Approve { device_id, role } => CliRequest::ApproveDevice {
-            device_id_hex: device_id,
-            role,
-        },
-        Command::Revoke { device_id } => CliRequest::RevokeDevice {
-            device_id_hex: device_id,
-        },
-        Command::Mnemonic => CliRequest::ShowMnemonic,
-        Command::Files => CliRequest::ListFiles,
-        Command::Add { path } => CliRequest::AddFile { path },
-        Command::Transfers => CliRequest::TransferStatus,
-        // Join is handled before we get here.
-        Command::Join { .. } => unreachable!(),
-    };
+    let request = command_to_request(command);
 
     murmur_ipc::send_message(&mut stream, &request)?;
     let response: CliResponse = murmur_ipc::recv_message(&mut stream)?;
@@ -143,6 +203,81 @@ fn run_online(base_dir: &std::path::Path, command: Command, json: bool) -> Resul
     }
 
     Ok(())
+}
+
+/// Convert a CLI command to an IPC request.
+fn command_to_request(command: Command) -> CliRequest {
+    match command {
+        Command::Status => CliRequest::Status,
+        Command::Devices => CliRequest::ListDevices,
+        Command::Pending => CliRequest::ListPending,
+        Command::Approve { device_id, role } => CliRequest::ApproveDevice {
+            device_id_hex: device_id,
+            role,
+        },
+        Command::Revoke { device_id } => CliRequest::RevokeDevice {
+            device_id_hex: device_id,
+        },
+        Command::Mnemonic => CliRequest::ShowMnemonic,
+        Command::Files => CliRequest::ListFiles,
+        Command::Add { path } => CliRequest::AddFile { path },
+        Command::Transfers => CliRequest::TransferStatus,
+        Command::Folder(sub) => match sub {
+            FolderCommand::Create { name } => CliRequest::CreateFolder { name },
+            FolderCommand::List => CliRequest::ListFolders,
+            FolderCommand::Subscribe {
+                folder_id,
+                local_path,
+                read_only,
+            } => CliRequest::SubscribeFolder {
+                folder_id_hex: folder_id,
+                local_path,
+                mode: if read_only {
+                    "read-only".to_string()
+                } else {
+                    "read-write".to_string()
+                },
+            },
+            FolderCommand::Unsubscribe {
+                folder_id,
+                keep_local,
+            } => CliRequest::UnsubscribeFolder {
+                folder_id_hex: folder_id,
+                keep_local,
+            },
+            FolderCommand::Files { folder_id } => CliRequest::FolderFiles {
+                folder_id_hex: folder_id,
+            },
+            FolderCommand::Status { folder_id } => CliRequest::FolderStatus {
+                folder_id_hex: folder_id,
+            },
+            FolderCommand::Remove { folder_id } => CliRequest::RemoveFolder {
+                folder_id_hex: folder_id,
+            },
+            FolderCommand::Mode { folder_id, mode } => CliRequest::SetFolderMode {
+                folder_id_hex: folder_id,
+                mode,
+            },
+        },
+        Command::Conflicts { folder } => CliRequest::ListConflicts {
+            folder_id_hex: folder,
+        },
+        Command::Resolve {
+            folder_id,
+            path,
+            chosen_hash,
+        } => CliRequest::ResolveConflict {
+            folder_id_hex: folder_id,
+            path,
+            chosen_hash_hex: chosen_hash,
+        },
+        Command::History { folder_id, path } => CliRequest::FileHistory {
+            folder_id_hex: folder_id,
+            path,
+        },
+        // Join is handled before we get here.
+        Command::Join { .. } => unreachable!(),
+    }
 }
 
 /// Print a response as JSON.
@@ -223,6 +358,74 @@ fn print_plain(response: &CliResponse) {
                     );
                 }
             }
+        }
+        CliResponse::Folders { folders } => {
+            if folders.is_empty() {
+                println!("No shared folders.");
+            } else {
+                println!("Shared folders ({}):", folders.len());
+                for f in folders {
+                    let sub = if f.subscribed {
+                        format!("subscribed, {}", f.mode.as_deref().unwrap_or("unknown"))
+                    } else {
+                        "not subscribed".to_string()
+                    };
+                    println!(
+                        "  {} {} ({} files, {})",
+                        f.folder_id, f.name, f.file_count, sub
+                    );
+                }
+            }
+        }
+        CliResponse::FolderStatus {
+            folder_id,
+            name,
+            file_count,
+            conflict_count,
+            sync_status,
+        } => {
+            println!("Folder:     {name}");
+            println!("Folder ID:  {folder_id}");
+            println!("Files:      {file_count}");
+            println!("Conflicts:  {conflict_count}");
+            println!("Status:     {sync_status}");
+        }
+        CliResponse::Conflicts { conflicts } => {
+            if conflicts.is_empty() {
+                println!("No active conflicts.");
+            } else {
+                println!("Active conflicts ({}):", conflicts.len());
+                for c in conflicts {
+                    println!(
+                        "  {} ({}) — {} versions",
+                        c.path,
+                        c.folder_name,
+                        c.versions.len()
+                    );
+                    for v in &c.versions {
+                        println!(
+                            "    {} by {} ({}) at {}",
+                            v.blob_hash, v.device_name, v.device_id, v.hlc
+                        );
+                    }
+                }
+            }
+        }
+        CliResponse::FileVersions { versions } => {
+            if versions.is_empty() {
+                println!("No version history.");
+            } else {
+                println!("File versions ({}):", versions.len());
+                for v in versions {
+                    println!(
+                        "  {} {} bytes by {} ({}) at {}",
+                        v.blob_hash, v.size, v.device_name, v.device_id, v.modified_at
+                    );
+                }
+            }
+        }
+        CliResponse::Event { event } => {
+            println!("[{}] {}", event.event_type, event.data);
         }
         CliResponse::Ok { message } => {
             println!("{message}");

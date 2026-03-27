@@ -64,6 +64,76 @@ pub enum CliRequest {
     },
     /// Query in-flight blob transfer status.
     TransferStatus,
+
+    // -- Folder management (M17) --
+    /// Create a new shared folder.
+    CreateFolder {
+        /// Human-readable folder name.
+        name: String,
+    },
+    /// Remove a shared folder.
+    RemoveFolder {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+    },
+    /// List all shared folders.
+    ListFolders,
+    /// Subscribe this device to a folder.
+    SubscribeFolder {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// Local directory path for the folder's files.
+        local_path: String,
+        /// Sync mode: "read-write" or "read-only".
+        mode: String,
+    },
+    /// Unsubscribe this device from a folder.
+    UnsubscribeFolder {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// Whether to keep local files after unsubscribing.
+        keep_local: bool,
+    },
+    /// List files in a specific folder.
+    FolderFiles {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+    },
+    /// Get status for a specific folder.
+    FolderStatus {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+    },
+    /// List active conflicts, optionally filtered by folder.
+    ListConflicts {
+        /// Optional folder ID filter (64-character hex string).
+        folder_id_hex: Option<String>,
+    },
+    /// Resolve a conflict by choosing a version.
+    ResolveConflict {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// File path within the folder.
+        path: String,
+        /// Chosen blob hash as 64-character hex string.
+        chosen_hash_hex: String,
+    },
+    /// Get version history for a file.
+    FileHistory {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// File path within the folder.
+        path: String,
+    },
+    /// Change the sync mode for a folder subscription.
+    SetFolderMode {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// New sync mode: "read-write" or "read-only".
+        mode: String,
+    },
+    /// Subscribe to real-time engine events (long-lived connection).
+    SubscribeEvents,
 }
 
 /// A response sent from `murmurd` to `murmur-cli`.
@@ -119,7 +189,46 @@ pub enum CliResponse {
         /// Human-readable error message.
         message: String,
     },
+
+    // -- Folder responses (M17) --
+    /// List of shared folders.
+    Folders {
+        /// Folder info list.
+        folders: Vec<FolderInfoIpc>,
+    },
+    /// Status of a specific folder.
+    FolderStatus {
+        /// Folder ID (hex).
+        folder_id: String,
+        /// Folder name.
+        name: String,
+        /// Number of files in the folder.
+        file_count: u64,
+        /// Number of active conflicts.
+        conflict_count: u64,
+        /// Sync status description.
+        sync_status: String,
+    },
+    /// List of active conflicts.
+    Conflicts {
+        /// Conflict info list.
+        conflicts: Vec<ConflictInfoIpc>,
+    },
+    /// File version history.
+    FileVersions {
+        /// Versions ordered by HLC.
+        versions: Vec<FileVersionIpc>,
+    },
+    /// A real-time engine event (pushed via event stream).
+    Event {
+        /// The event data.
+        event: EngineEventIpc,
+    },
 }
+
+// ---------------------------------------------------------------------------
+// IPC data types
+// ---------------------------------------------------------------------------
 
 /// Device information for IPC transport.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -160,6 +269,73 @@ pub struct TransferInfoIpc {
     pub bytes_transferred: u64,
     /// Total blob size in bytes.
     pub total_bytes: u64,
+}
+
+/// Folder information for IPC transport.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FolderInfoIpc {
+    /// Folder ID (hex).
+    pub folder_id: String,
+    /// Human-readable folder name.
+    pub name: String,
+    /// Creator device ID (hex).
+    pub created_by: String,
+    /// Number of files in the folder.
+    pub file_count: u64,
+    /// Whether this device is subscribed.
+    pub subscribed: bool,
+    /// Sync mode if subscribed.
+    pub mode: Option<String>,
+}
+
+/// Conflict information for IPC transport.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConflictInfoIpc {
+    /// Folder ID (hex).
+    pub folder_id: String,
+    /// Folder name.
+    pub folder_name: String,
+    /// File path within the folder.
+    pub path: String,
+    /// Competing versions.
+    pub versions: Vec<ConflictVersionIpc>,
+}
+
+/// One side of a conflict for IPC transport.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConflictVersionIpc {
+    /// Content hash (hex).
+    pub blob_hash: String,
+    /// Device ID that created this version (hex).
+    pub device_id: String,
+    /// Device name.
+    pub device_name: String,
+    /// HLC timestamp.
+    pub hlc: u64,
+}
+
+/// File version for IPC transport.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileVersionIpc {
+    /// Content hash (hex).
+    pub blob_hash: String,
+    /// Device ID that created this version (hex).
+    pub device_id: String,
+    /// Device name.
+    pub device_name: String,
+    /// Modification HLC timestamp.
+    pub modified_at: u64,
+    /// File size in bytes.
+    pub size: u64,
+}
+
+/// Engine event for IPC transport.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EngineEventIpc {
+    /// Event type name (e.g., "file_synced", "conflict_detected").
+    pub event_type: String,
+    /// JSON-serialized event details.
+    pub data: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +452,45 @@ mod tests {
                 path: "/tmp/file.txt".to_string(),
             },
             CliRequest::TransferStatus,
+            CliRequest::CreateFolder {
+                name: "Photos".to_string(),
+            },
+            CliRequest::RemoveFolder {
+                folder_id_hex: "cc".repeat(32),
+            },
+            CliRequest::ListFolders,
+            CliRequest::SubscribeFolder {
+                folder_id_hex: "dd".repeat(32),
+                local_path: "/home/user/Sync/Photos".to_string(),
+                mode: "read-write".to_string(),
+            },
+            CliRequest::UnsubscribeFolder {
+                folder_id_hex: "ee".repeat(32),
+                keep_local: true,
+            },
+            CliRequest::FolderFiles {
+                folder_id_hex: "ff".repeat(32),
+            },
+            CliRequest::FolderStatus {
+                folder_id_hex: "aa".repeat(32),
+            },
+            CliRequest::ListConflicts {
+                folder_id_hex: None,
+            },
+            CliRequest::ResolveConflict {
+                folder_id_hex: "bb".repeat(32),
+                path: "readme.txt".to_string(),
+                chosen_hash_hex: "cc".repeat(32),
+            },
+            CliRequest::FileHistory {
+                folder_id_hex: "dd".repeat(32),
+                path: "docs/plan.md".to_string(),
+            },
+            CliRequest::SetFolderMode {
+                folder_id_hex: "ee".repeat(32),
+                mode: "read-only".to_string(),
+            },
+            CliRequest::SubscribeEvents,
         ];
         for req in variants {
             let bytes = postcard::to_allocvec(&req).unwrap();
@@ -332,6 +547,86 @@ mod tests {
     }
 
     #[test]
+    fn test_response_roundtrip_folders() {
+        let resp = CliResponse::Folders {
+            folders: vec![FolderInfoIpc {
+                folder_id: "aa".repeat(32),
+                name: "Photos".to_string(),
+                created_by: "bb".repeat(32),
+                file_count: 42,
+                subscribed: true,
+                mode: Some("read-write".to_string()),
+            }],
+        };
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let decoded: CliResponse = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(resp, decoded);
+    }
+
+    #[test]
+    fn test_response_roundtrip_conflicts() {
+        let resp = CliResponse::Conflicts {
+            conflicts: vec![ConflictInfoIpc {
+                folder_id: "aa".repeat(32),
+                folder_name: "Photos".to_string(),
+                path: "readme.txt".to_string(),
+                versions: vec![ConflictVersionIpc {
+                    blob_hash: "bb".repeat(32),
+                    device_id: "cc".repeat(32),
+                    device_name: "Phone".to_string(),
+                    hlc: 12345,
+                }],
+            }],
+        };
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let decoded: CliResponse = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(resp, decoded);
+    }
+
+    #[test]
+    fn test_response_roundtrip_file_versions() {
+        let resp = CliResponse::FileVersions {
+            versions: vec![FileVersionIpc {
+                blob_hash: "aa".repeat(32),
+                device_id: "bb".repeat(32),
+                device_name: "NAS".to_string(),
+                modified_at: 999,
+                size: 2048,
+            }],
+        };
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let decoded: CliResponse = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(resp, decoded);
+    }
+
+    #[test]
+    fn test_response_roundtrip_event() {
+        let resp = CliResponse::Event {
+            event: EngineEventIpc {
+                event_type: "file_synced".to_string(),
+                data: r#"{"path":"photo.jpg"}"#.to_string(),
+            },
+        };
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let decoded: CliResponse = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(resp, decoded);
+    }
+
+    #[test]
+    fn test_response_roundtrip_folder_status() {
+        let resp = CliResponse::FolderStatus {
+            folder_id: "aa".repeat(32),
+            name: "Documents".to_string(),
+            file_count: 10,
+            conflict_count: 2,
+            sync_status: "synced".to_string(),
+        };
+        let bytes = postcard::to_allocvec(&resp).unwrap();
+        let decoded: CliResponse = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(resp, decoded);
+    }
+
+    #[test]
     fn test_response_roundtrip_all_variants() {
         let variants = vec![
             CliResponse::Status {
@@ -360,6 +655,22 @@ mod tests {
             },
             CliResponse::Error {
                 message: "failed".to_string(),
+            },
+            CliResponse::Folders { folders: vec![] },
+            CliResponse::FolderStatus {
+                folder_id: "aa".repeat(32),
+                name: "Test".to_string(),
+                file_count: 0,
+                conflict_count: 0,
+                sync_status: "empty".to_string(),
+            },
+            CliResponse::Conflicts { conflicts: vec![] },
+            CliResponse::FileVersions { versions: vec![] },
+            CliResponse::Event {
+                event: EngineEventIpc {
+                    event_type: "test".to_string(),
+                    data: "{}".to_string(),
+                },
             },
         ];
         for resp in variants {

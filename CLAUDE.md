@@ -27,7 +27,7 @@ crates/
   murmur-net/        Network (iroh QUIC + gossip + shared wire utilities)
   murmur-engine/     Orchestrator (sync, approval, blob transfer, storage-agnostic)
   murmur-ipc/        IPC protocol types for daemon ↔ CLI communication
-  murmur-cli/        CLI tool for managing murmurd (init, join, approve, status, etc.)
+  murmur-cli/        CLI tool for managing murmurd (folders, conflicts, devices, status, etc.)
   murmurd/           Headless backup daemon (no subcommands, managed via murmur-cli)
 tests/
   integration/       Multi-device simulation tests
@@ -183,7 +183,7 @@ When fixing a reported bug:
 
 ## Folder Sync Architecture
 
-Murmur is a Syncthing-style folder sync app. Milestones 13–16 (folder model, conflicts, streaming blobs, filesystem watching) are complete. Key design decisions:
+Murmur is a Syncthing-style folder sync app. Milestones 13–17 (folder model, conflicts, streaming blobs, filesystem watching, IPC & CLI expansion) are complete. Key design decisions:
 
 - **Shared folders** map to real directories on each device. murmurd watches them with `notify`.
 - **Per-device subscribe model**: each device chooses which folders to sync and whether read-write or read-only.
@@ -192,6 +192,8 @@ Murmur is a Syncthing-style folder sync app. Milestones 13–16 (folder model, c
 - **Three frontends**: Desktop app (iced), Web UI (htmx/axum), CLI — all thin clients to murmurd via IPC.
 - **Streaming blobs**: no hard size limit, incremental blake3, chunked transfer, bounded memory.
 - **Ignore patterns**: `.murmurignore` per folder (gitignore syntax) via `ignore` crate.
+- **IPC protocol**: Unix socket, length-prefixed postcard serialization. Supports event streaming via `SubscribeEvents` for real-time UI updates.
+- **CLI commands**: `murmur-cli folder {create,list,subscribe,unsubscribe,files,status,remove,mode}`, `conflicts`, `resolve`, `history`. All support `--json`.
 - **Protocol spec**: `docs/protocol.md` — formal specification for third-party interoperability.
 
 See @docs/plan.md for full milestone details and design rationale.

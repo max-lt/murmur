@@ -23,8 +23,11 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use murmur_ipc::{CliRequest, CliResponse, DeviceInfoIpc, FileInfoIpc, TransferInfoIpc};
-use murmur_types::{DeviceId, FolderId, SyncMode};
+use murmur_ipc::{
+    CliRequest, CliResponse, ConflictInfoIpc, ConflictVersionIpc, DeviceInfoIpc, EngineEventIpc,
+    FileInfoIpc, FileVersionIpc, FolderInfoIpc, TransferInfoIpc,
+};
+use murmur_types::{BlobHash, DeviceId, FolderId, SyncMode};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
@@ -280,6 +283,10 @@ fn run_daemon(
             None
         };
 
+        // Set up event broadcast channel for IPC event streaming.
+        let (ipc_event_tx, _) = tokio::sync::broadcast::channel::<murmur_engine::EngineEvent>(256);
+        let ipc_event_tx_for_forward = ipc_event_tx.clone();
+
         // Set up filesystem watching and sync for configured folders.
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         platform_ref.set_event_tx(event_tx);
@@ -389,12 +396,15 @@ fn run_daemon(
             }
         });
 
-        // Spawn reverse sync task (engine events → filesystem).
+        // Spawn reverse sync task (engine events → filesystem + IPC event broadcast).
         let storage_for_reverse = storage.clone();
         let folders_for_reverse = synced_folders_arc.clone();
         let echo_for_reverse = echo_suppressor.clone();
         tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
+                // Forward to IPC event subscribers (best-effort, ignore if no subscribers).
+                let _ = ipc_event_tx_for_forward.send(event.clone());
+
                 match sync::handle_reverse_sync_event(
                     &event,
                     &folders_for_reverse,
@@ -418,6 +428,7 @@ fn run_daemon(
             start_time,
             broadcast_tx: net_handle.broadcast_tx.clone(),
             connected_peers: net_handle.connected_peers.clone(),
+            event_broadcast: ipc_event_tx,
         });
 
         let accept_handle = tokio::task::spawn_blocking(move || {
@@ -500,6 +511,8 @@ struct DaemonCtx {
     start_time: Instant,
     broadcast_tx: mpsc::UnboundedSender<Vec<u8>>,
     connected_peers: Arc<std::sync::atomic::AtomicU64>,
+    /// Broadcast channel for IPC event streaming.
+    event_broadcast: tokio::sync::broadcast::Sender<murmur_engine::EngineEvent>,
 }
 
 /// Handle a single CLI connection.
@@ -507,10 +520,46 @@ fn handle_connection(mut stream: std::os::unix::net::UnixStream, ctx: &DaemonCtx
     let request: CliRequest = murmur_ipc::recv_message(&mut stream)?;
     info!(?request, "received CLI request");
 
+    // Event streaming is a special case: keep the connection open.
+    if matches!(request, CliRequest::SubscribeEvents) {
+        handle_event_stream(stream, ctx);
+        return Ok(());
+    }
+
     let response = process_request(request, ctx);
 
     murmur_ipc::send_message(&mut stream, &response)?;
     Ok(())
+}
+
+/// Handle a long-lived event stream connection.
+///
+/// Subscribes to the engine event broadcast channel and sends each event
+/// as a `CliResponse::Event` message over the connection until the client
+/// disconnects or an error occurs.
+fn handle_event_stream(mut stream: std::os::unix::net::UnixStream, ctx: &DaemonCtx) {
+    let mut rx = ctx.event_broadcast.subscribe();
+    info!("client subscribed to event stream");
+
+    loop {
+        match rx.blocking_recv() {
+            Ok(event) => {
+                let ipc_event = engine_event_to_ipc(&event, ctx);
+                let response = CliResponse::Event { event: ipc_event };
+                if murmur_ipc::send_message(&mut stream, &response).is_err() {
+                    debug!("event stream client disconnected");
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                warn!(skipped = n, "event stream subscriber lagged");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                debug!("event broadcast channel closed");
+                break;
+            }
+        }
+    }
 }
 
 /// Process a CLI request and produce a response.
@@ -642,112 +691,34 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
             let transfers = items
                 .into_iter()
                 .map(|(blob_hash, _retry_count)| {
-                    // Check blob size on disk for total_bytes.
                     let total_bytes = match ctx.storage.load_blob(blob_hash) {
                         Ok(Some(data)) => data.len() as u64,
                         _ => 0,
                     };
                     TransferInfoIpc {
                         blob_hash: blob_hash.to_string(),
-                        bytes_transferred: 0, // pending = not yet transferred
+                        bytes_transferred: 0,
                         total_bytes,
                     }
                 })
                 .collect();
             CliResponse::TransferStatus { transfers }
         }
-        CliRequest::AddFile { path } => {
-            let file_path = std::path::Path::new(&path);
-            if !file_path.exists() {
-                return CliResponse::Error {
-                    message: format!("file not found: {path}"),
-                };
-            }
-            let data = match std::fs::read(file_path) {
-                Ok(d) => d,
-                Err(e) => {
-                    return CliResponse::Error {
-                        message: format!("read file: {e}"),
-                    };
-                }
-            };
-            let blob_hash = murmur_types::BlobHash::from_data(&data);
-            let filename = file_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let size = data.len() as u64;
-            let mime_type = guess_mime(&filename);
+        CliRequest::AddFile { path } => process_add_file(path, ctx),
 
+        // -- Folder management (M17) --
+        CliRequest::CreateFolder { name } => {
             let mut eng = ctx.engine.lock().unwrap();
-
-            // Get or create a default folder for the file.
-            let folder_id = {
-                let folders = eng.list_folders();
-                if let Some(f) = folders.first() {
-                    f.folder_id
-                } else {
-                    match eng.create_folder("default") {
-                        Ok((folder, entries)) => {
-                            for entry in &entries {
-                                let _ = ctx.broadcast_tx.send(entry.to_bytes());
-                            }
-                            folder.folder_id
-                        }
-                        Err(e) => {
-                            return CliResponse::Error {
-                                message: format!("create default folder: {e}"),
-                            };
-                        }
-                    }
-                }
-            };
-
-            // Auto-subscribe to the folder if not already subscribed.
-            let device_id = eng.device_id();
-            let already_subscribed = eng
-                .folder_subscriptions(folder_id)
-                .iter()
-                .any(|s| s.device_id == device_id);
-            if !already_subscribed {
-                match eng.subscribe_folder(folder_id, murmur_types::SyncMode::ReadWrite) {
-                    Ok(entry) => {
+            match eng.create_folder(&name) {
+                Ok((folder, entries)) => {
+                    for entry in &entries {
                         let _ = ctx.broadcast_tx.send(entry.to_bytes());
                     }
-                    Err(e) => {
-                        return CliResponse::Error {
-                            message: format!("subscribe to folder: {e}"),
-                        };
-                    }
-                }
-            }
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let metadata = murmur_types::FileMetadata {
-                blob_hash,
-                folder_id,
-                path: filename.clone(),
-                size,
-                mime_type: mime_type.clone(),
-                created_at: now,
-                modified_at: now,
-                device_origin: eng.device_id(),
-            };
-            match eng.add_file(metadata, data) {
-                Ok(entry) => {
-                    let _ = ctx.broadcast_tx.send(entry.to_bytes());
-                    // Enqueue blob for push sync to peers.
-                    if let Err(e) = ctx.storage.push_queue_add(blob_hash) {
-                        error!(error = %e, "enqueue blob for push");
-                    }
                     if let Err(e) = ctx.storage.flush() {
-                        error!(error = %e, "flush after add_file");
+                        error!(error = %e, "flush after create_folder");
                     }
                     CliResponse::Ok {
-                        message: format!("File added: {filename} ({blob_hash})"),
+                        message: format!("Folder created: {} ({})", folder.name, folder.folder_id),
                     }
                 }
                 Err(e) => CliResponse::Error {
@@ -755,6 +726,368 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 },
             }
         }
+        CliRequest::RemoveFolder { folder_id_hex } => {
+            let folder_id = match parse_folder_id(&folder_id_hex) {
+                Ok(id) => id,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            let mut eng = ctx.engine.lock().unwrap();
+            match eng.remove_folder(folder_id) {
+                Ok(entry) => {
+                    let _ = ctx.broadcast_tx.send(entry.to_bytes());
+                    if let Err(e) = ctx.storage.flush() {
+                        error!(error = %e, "flush after remove_folder");
+                    }
+                    CliResponse::Ok {
+                        message: format!("Folder {folder_id} removed."),
+                    }
+                }
+                Err(e) => CliResponse::Error {
+                    message: format!("{e}"),
+                },
+            }
+        }
+        CliRequest::ListFolders => {
+            let eng = ctx.engine.lock().unwrap();
+            let device_id = eng.device_id();
+            let folders = eng
+                .list_folders()
+                .into_iter()
+                .map(|f| {
+                    let file_count = eng.folder_files(f.folder_id).len() as u64;
+                    let sub = eng
+                        .folder_subscriptions(f.folder_id)
+                        .into_iter()
+                        .find(|s| s.device_id == device_id);
+                    FolderInfoIpc {
+                        folder_id: f.folder_id.to_string(),
+                        name: f.name,
+                        created_by: f.created_by.to_string(),
+                        file_count,
+                        subscribed: sub.is_some(),
+                        mode: sub.map(|s| s.mode.to_string()),
+                    }
+                })
+                .collect();
+            CliResponse::Folders { folders }
+        }
+        CliRequest::SubscribeFolder {
+            folder_id_hex,
+            local_path: _,
+            mode,
+        } => {
+            let folder_id = match parse_folder_id(&folder_id_hex) {
+                Ok(id) => id,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            let sync_mode = match mode.as_str() {
+                "read-only" => SyncMode::ReadOnly,
+                _ => SyncMode::ReadWrite,
+            };
+            let mut eng = ctx.engine.lock().unwrap();
+            match eng.subscribe_folder(folder_id, sync_mode) {
+                Ok(entry) => {
+                    let _ = ctx.broadcast_tx.send(entry.to_bytes());
+                    if let Err(e) = ctx.storage.flush() {
+                        error!(error = %e, "flush after subscribe_folder");
+                    }
+                    CliResponse::Ok {
+                        message: format!("Subscribed to folder {folder_id} as {sync_mode}."),
+                    }
+                }
+                Err(e) => CliResponse::Error {
+                    message: format!("{e}"),
+                },
+            }
+        }
+        CliRequest::UnsubscribeFolder {
+            folder_id_hex,
+            keep_local: _,
+        } => {
+            let folder_id = match parse_folder_id(&folder_id_hex) {
+                Ok(id) => id,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            let mut eng = ctx.engine.lock().unwrap();
+            match eng.unsubscribe_folder(folder_id) {
+                Ok(entry) => {
+                    let _ = ctx.broadcast_tx.send(entry.to_bytes());
+                    if let Err(e) = ctx.storage.flush() {
+                        error!(error = %e, "flush after unsubscribe_folder");
+                    }
+                    CliResponse::Ok {
+                        message: format!("Unsubscribed from folder {folder_id}."),
+                    }
+                }
+                Err(e) => CliResponse::Error {
+                    message: format!("{e}"),
+                },
+            }
+        }
+        CliRequest::FolderFiles { folder_id_hex } => {
+            let folder_id = match parse_folder_id(&folder_id_hex) {
+                Ok(id) => id,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            let eng = ctx.engine.lock().unwrap();
+            let files = eng
+                .folder_files(folder_id)
+                .into_iter()
+                .map(|meta| FileInfoIpc {
+                    blob_hash: meta.blob_hash.to_string(),
+                    folder_id: meta.folder_id.to_string(),
+                    path: meta.path.clone(),
+                    size: meta.size,
+                    mime_type: meta.mime_type.clone(),
+                    device_origin: meta.device_origin.to_string(),
+                })
+                .collect();
+            CliResponse::Files { files }
+        }
+        CliRequest::FolderStatus { folder_id_hex } => {
+            let folder_id = match parse_folder_id(&folder_id_hex) {
+                Ok(id) => id,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            let eng = ctx.engine.lock().unwrap();
+            let folder = eng
+                .list_folders()
+                .into_iter()
+                .find(|f| f.folder_id == folder_id);
+            match folder {
+                Some(f) => {
+                    let file_count = eng.folder_files(folder_id).len() as u64;
+                    let conflict_count = eng.list_conflicts_in_folder(folder_id).len() as u64;
+                    let sync_status = if conflict_count > 0 {
+                        "conflicts".to_string()
+                    } else if file_count > 0 {
+                        "synced".to_string()
+                    } else {
+                        "empty".to_string()
+                    };
+                    CliResponse::FolderStatus {
+                        folder_id: folder_id.to_string(),
+                        name: f.name,
+                        file_count,
+                        conflict_count,
+                        sync_status,
+                    }
+                }
+                None => CliResponse::Error {
+                    message: format!("folder not found: {folder_id_hex}"),
+                },
+            }
+        }
+        CliRequest::ListConflicts { folder_id_hex } => {
+            let folder_filter = match folder_id_hex {
+                Some(hex) => match parse_folder_id(&hex) {
+                    Ok(id) => Some(id),
+                    Err(e) => return CliResponse::Error { message: e },
+                },
+                None => None,
+            };
+            let eng = ctx.engine.lock().unwrap();
+            let conflicts = build_conflict_list(&eng, folder_filter);
+            CliResponse::Conflicts { conflicts }
+        }
+        CliRequest::ResolveConflict {
+            folder_id_hex,
+            path,
+            chosen_hash_hex,
+        } => {
+            let folder_id = match parse_folder_id(&folder_id_hex) {
+                Ok(id) => id,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            let chosen_hash = match parse_blob_hash(&chosen_hash_hex) {
+                Ok(h) => h,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            let mut eng = ctx.engine.lock().unwrap();
+            match eng.resolve_conflict(folder_id, &path, chosen_hash) {
+                Ok(entry) => {
+                    let _ = ctx.broadcast_tx.send(entry.to_bytes());
+                    if let Err(e) = ctx.storage.flush() {
+                        error!(error = %e, "flush after resolve_conflict");
+                    }
+                    CliResponse::Ok {
+                        message: format!("Conflict resolved for {path}."),
+                    }
+                }
+                Err(e) => CliResponse::Error {
+                    message: format!("{e}"),
+                },
+            }
+        }
+        CliRequest::FileHistory {
+            folder_id_hex,
+            path,
+        } => {
+            let folder_id = match parse_folder_id(&folder_id_hex) {
+                Ok(id) => id,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            let eng = ctx.engine.lock().unwrap();
+            let versions = eng
+                .file_history(folder_id, &path)
+                .into_iter()
+                .map(|(blob_hash, hlc)| {
+                    let (device_id_str, device_name, size) =
+                        find_version_info(&eng, folder_id, &path, blob_hash, hlc);
+                    FileVersionIpc {
+                        blob_hash: blob_hash.to_string(),
+                        device_id: device_id_str,
+                        device_name,
+                        modified_at: hlc,
+                        size,
+                    }
+                })
+                .collect();
+            CliResponse::FileVersions { versions }
+        }
+        CliRequest::SetFolderMode {
+            folder_id_hex,
+            mode,
+        } => {
+            let folder_id = match parse_folder_id(&folder_id_hex) {
+                Ok(id) => id,
+                Err(e) => return CliResponse::Error { message: e },
+            };
+            let sync_mode = match mode.as_str() {
+                "read-only" => SyncMode::ReadOnly,
+                "read-write" => SyncMode::ReadWrite,
+                other => {
+                    return CliResponse::Error {
+                        message: format!("unknown mode: {other:?} (use read-write or read-only)"),
+                    };
+                }
+            };
+            // Unsubscribe then re-subscribe with new mode.
+            let mut eng = ctx.engine.lock().unwrap();
+            if let Err(e) = eng.unsubscribe_folder(folder_id) {
+                return CliResponse::Error {
+                    message: format!("unsubscribe: {e}"),
+                };
+            }
+            match eng.subscribe_folder(folder_id, sync_mode) {
+                Ok(entry) => {
+                    let _ = ctx.broadcast_tx.send(entry.to_bytes());
+                    if let Err(e) = ctx.storage.flush() {
+                        error!(error = %e, "flush after set_folder_mode");
+                    }
+                    CliResponse::Ok {
+                        message: format!("Folder {folder_id} mode set to {sync_mode}."),
+                    }
+                }
+                Err(e) => CliResponse::Error {
+                    message: format!("{e}"),
+                },
+            }
+        }
+        // SubscribeEvents is handled in handle_connection before we get here.
+        CliRequest::SubscribeEvents => CliResponse::Error {
+            message: "event streaming handled elsewhere".to_string(),
+        },
+    }
+}
+
+/// Process `AddFile` request (extracted for readability).
+fn process_add_file(path: String, ctx: &DaemonCtx) -> CliResponse {
+    let file_path = std::path::Path::new(&path);
+    if !file_path.exists() {
+        return CliResponse::Error {
+            message: format!("file not found: {path}"),
+        };
+    }
+    let data = match std::fs::read(file_path) {
+        Ok(d) => d,
+        Err(e) => {
+            return CliResponse::Error {
+                message: format!("read file: {e}"),
+            };
+        }
+    };
+    let blob_hash = murmur_types::BlobHash::from_data(&data);
+    let filename = file_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let size = data.len() as u64;
+    let mime_type = guess_mime(&filename);
+
+    let mut eng = ctx.engine.lock().unwrap();
+
+    // Get or create a default folder for the file.
+    let folder_id = {
+        let folders = eng.list_folders();
+        if let Some(f) = folders.first() {
+            f.folder_id
+        } else {
+            match eng.create_folder("default") {
+                Ok((folder, entries)) => {
+                    for entry in &entries {
+                        let _ = ctx.broadcast_tx.send(entry.to_bytes());
+                    }
+                    folder.folder_id
+                }
+                Err(e) => {
+                    return CliResponse::Error {
+                        message: format!("create default folder: {e}"),
+                    };
+                }
+            }
+        }
+    };
+
+    // Auto-subscribe to the folder if not already subscribed.
+    let device_id = eng.device_id();
+    let already_subscribed = eng
+        .folder_subscriptions(folder_id)
+        .iter()
+        .any(|s| s.device_id == device_id);
+    if !already_subscribed {
+        match eng.subscribe_folder(folder_id, murmur_types::SyncMode::ReadWrite) {
+            Ok(entry) => {
+                let _ = ctx.broadcast_tx.send(entry.to_bytes());
+            }
+            Err(e) => {
+                return CliResponse::Error {
+                    message: format!("subscribe to folder: {e}"),
+                };
+            }
+        }
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let metadata = murmur_types::FileMetadata {
+        blob_hash,
+        folder_id,
+        path: filename.clone(),
+        size,
+        mime_type: mime_type.clone(),
+        created_at: now,
+        modified_at: now,
+        device_origin: eng.device_id(),
+    };
+    match eng.add_file(metadata, data) {
+        Ok(entry) => {
+            let _ = ctx.broadcast_tx.send(entry.to_bytes());
+            if let Err(e) = ctx.storage.push_queue_add(blob_hash) {
+                error!(error = %e, "enqueue blob for push");
+            }
+            if let Err(e) = ctx.storage.flush() {
+                error!(error = %e, "flush after add_file");
+            }
+            CliResponse::Ok {
+                message: format!("File added: {filename} ({blob_hash})"),
+            }
+        }
+        Err(e) => CliResponse::Error {
+            message: format!("{e}"),
+        },
     }
 }
 
@@ -847,6 +1180,274 @@ fn guess_mime(filename: &str) -> Option<String> {
     Some(mime.to_string())
 }
 
+/// Parse a hex string into a [`FolderId`].
+fn parse_folder_id(hex_str: &str) -> Result<FolderId, String> {
+    let hex_str = hex_str.trim();
+    if hex_str.len() != 64 {
+        return Err(format!(
+            "folder ID must be 64 hex characters (32 bytes), got {}",
+            hex_str.len()
+        ));
+    }
+    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex in folder ID: {e}"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "folder ID must be 32 bytes".to_string())?;
+    Ok(FolderId::from_bytes(arr))
+}
+
+/// Parse a hex string into a [`BlobHash`].
+fn parse_blob_hash(hex_str: &str) -> Result<BlobHash, String> {
+    let hex_str = hex_str.trim();
+    if hex_str.len() != 64 {
+        return Err(format!(
+            "blob hash must be 64 hex characters (32 bytes), got {}",
+            hex_str.len()
+        ));
+    }
+    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex in blob hash: {e}"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "blob hash must be 32 bytes".to_string())?;
+    Ok(BlobHash::from_bytes(arr))
+}
+
+/// Build a list of conflict info for IPC, optionally filtered by folder.
+fn build_conflict_list(
+    eng: &murmur_engine::MurmurEngine,
+    folder_filter: Option<FolderId>,
+) -> Vec<ConflictInfoIpc> {
+    let conflicts = match folder_filter {
+        Some(fid) => eng.list_conflicts_in_folder(fid),
+        None => eng.list_conflicts(),
+    };
+    let state = eng.state();
+    conflicts
+        .into_iter()
+        .map(|c| {
+            let folder_name = state
+                .folders
+                .get(&c.folder_id)
+                .map(|f| f.name.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            let versions = c
+                .versions
+                .iter()
+                .map(|v| {
+                    let device_name = state
+                        .devices
+                        .get(&v.device_id)
+                        .map(|d| d.name.clone())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    ConflictVersionIpc {
+                        blob_hash: v.blob_hash.to_string(),
+                        device_id: v.device_id.to_string(),
+                        device_name,
+                        hlc: v.hlc,
+                    }
+                })
+                .collect();
+            ConflictInfoIpc {
+                folder_id: c.folder_id.to_string(),
+                folder_name,
+                path: c.path,
+                versions,
+            }
+        })
+        .collect()
+}
+
+/// Look up device info for a specific file version.
+///
+/// Returns `(device_id_hex, device_name, file_size)` by scanning
+/// DAG entries for the one that introduced this version.
+fn find_version_info(
+    eng: &murmur_engine::MurmurEngine,
+    folder_id: FolderId,
+    _path: &str,
+    blob_hash: BlobHash,
+    hlc: u64,
+) -> (String, String, u64) {
+    use murmur_types::Action;
+
+    // Scan DAG entries to find the entry that introduced this version.
+    // Match on HLC + action containing matching blob_hash.
+    for entry in eng.all_entries() {
+        if entry.hlc != hlc {
+            continue;
+        }
+        let meta = match &entry.action {
+            Action::FileAdded { metadata }
+                if metadata.folder_id == folder_id && metadata.blob_hash == blob_hash =>
+            {
+                Some(metadata)
+            }
+            Action::FileModified { metadata, .. }
+                if metadata.folder_id == folder_id && metadata.blob_hash == blob_hash =>
+            {
+                Some(metadata)
+            }
+            _ => None,
+        };
+        if let Some(metadata) = meta {
+            let state = eng.state();
+            let device_name = state
+                .devices
+                .get(&metadata.device_origin)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            return (
+                metadata.device_origin.to_string(),
+                device_name,
+                metadata.size,
+            );
+        }
+    }
+
+    // Fallback: version not found in DAG (should be rare).
+    ("unknown".to_string(), "unknown".to_string(), 0)
+}
+
+/// Escape a string for embedding in a JSON value.
+///
+/// Handles quotes, backslashes, and control characters per RFC 8259.
+fn escape_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                // \u00XX for other control chars.
+                for unit in c.encode_utf16(&mut [0; 2]) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Convert an [`EngineEvent`] to its IPC representation.
+fn engine_event_to_ipc(event: &murmur_engine::EngineEvent, _ctx: &DaemonCtx) -> EngineEventIpc {
+    use murmur_engine::EngineEvent;
+    match event {
+        EngineEvent::DeviceJoinRequested { device_id, name } => EngineEventIpc {
+            event_type: "device_join_requested".to_string(),
+            data: format!(
+                "{{\"device_id\":\"{device_id}\",\"name\":\"{}\"}}",
+                escape_json(name)
+            ),
+        },
+        EngineEvent::DeviceApproved { device_id, role } => EngineEventIpc {
+            event_type: "device_approved".to_string(),
+            data: format!("{{\"device_id\":\"{device_id}\",\"role\":\"{role:?}\"}}"),
+        },
+        EngineEvent::DeviceRevoked { device_id } => EngineEventIpc {
+            event_type: "device_revoked".to_string(),
+            data: format!("{{\"device_id\":\"{device_id}\"}}"),
+        },
+        EngineEvent::FolderCreated { folder_id, name } => EngineEventIpc {
+            event_type: "folder_created".to_string(),
+            data: format!(
+                "{{\"folder_id\":\"{folder_id}\",\"name\":\"{}\"}}",
+                escape_json(name)
+            ),
+        },
+        EngineEvent::FolderSubscribed {
+            folder_id,
+            device_id,
+            mode,
+        } => EngineEventIpc {
+            event_type: "folder_subscribed".to_string(),
+            data: format!(
+                "{{\"folder_id\":\"{folder_id}\",\"device_id\":\"{device_id}\",\"mode\":\"{mode}\"}}"
+            ),
+        },
+        EngineEvent::FileSynced {
+            blob_hash,
+            folder_id,
+            path,
+        } => EngineEventIpc {
+            event_type: "file_synced".to_string(),
+            data: format!(
+                "{{\"blob_hash\":\"{blob_hash}\",\"folder_id\":\"{folder_id}\",\"path\":\"{}\"}}",
+                escape_json(path)
+            ),
+        },
+        EngineEvent::FileModified {
+            folder_id,
+            path,
+            new_hash,
+        } => EngineEventIpc {
+            event_type: "file_modified".to_string(),
+            data: format!(
+                "{{\"folder_id\":\"{folder_id}\",\"path\":\"{}\",\"new_hash\":\"{new_hash}\"}}",
+                escape_json(path)
+            ),
+        },
+        EngineEvent::BlobReceived { blob_hash } => EngineEventIpc {
+            event_type: "blob_received".to_string(),
+            data: format!("{{\"blob_hash\":\"{blob_hash}\"}}"),
+        },
+        EngineEvent::AccessRequested { from } => EngineEventIpc {
+            event_type: "access_requested".to_string(),
+            data: format!("{{\"from\":\"{from}\"}}"),
+        },
+        EngineEvent::AccessGranted { to } => EngineEventIpc {
+            event_type: "access_granted".to_string(),
+            data: format!("{{\"to\":\"{to}\"}}"),
+        },
+        EngineEvent::DagSynced { new_entries } => EngineEventIpc {
+            event_type: "dag_synced".to_string(),
+            data: format!("{{\"new_entries\":{new_entries}}}"),
+        },
+        EngineEvent::NetworkCreated { device_id } => EngineEventIpc {
+            event_type: "network_created".to_string(),
+            data: format!("{{\"device_id\":\"{device_id}\"}}"),
+        },
+        EngineEvent::NetworkJoined { device_id } => EngineEventIpc {
+            event_type: "network_joined".to_string(),
+            data: format!("{{\"device_id\":\"{device_id}\"}}"),
+        },
+        EngineEvent::BlobTransferProgress {
+            blob_hash,
+            bytes_transferred,
+            total_bytes,
+        } => EngineEventIpc {
+            event_type: "blob_transfer_progress".to_string(),
+            data: format!(
+                "{{\"blob_hash\":\"{blob_hash}\",\"bytes_transferred\":{bytes_transferred},\"total_bytes\":{total_bytes}}}"
+            ),
+        },
+        EngineEvent::ConflictDetected {
+            folder_id,
+            path,
+            versions,
+        } => {
+            let version_count = versions.len();
+            EngineEventIpc {
+                event_type: "conflict_detected".to_string(),
+                data: format!(
+                    "{{\"folder_id\":\"{folder_id}\",\"path\":\"{}\",\"version_count\":{version_count}}}",
+                    escape_json(path)
+                ),
+            }
+        }
+        EngineEvent::FileDeleted { folder_id, path } => EngineEventIpc {
+            event_type: "file_deleted".to_string(),
+            data: format!(
+                "{{\"folder_id\":\"{folder_id}\",\"path\":\"{}\"}}",
+                escape_json(path)
+            ),
+        },
+    }
+}
+
 /// Remove a stale socket file if no process is listening.
 fn cleanup_stale_socket(path: &Path) {
     if path.exists() {
@@ -899,6 +1500,8 @@ mod tests {
         );
 
         let (broadcast_tx, _rx) = mpsc::unbounded_channel();
+        let (event_broadcast, _) =
+            tokio::sync::broadcast::channel::<murmur_engine::EngineEvent>(16);
 
         DaemonCtx {
             engine: Arc::new(Mutex::new(engine)),
@@ -909,6 +1512,7 @@ mod tests {
             start_time: Instant::now(),
             broadcast_tx,
             connected_peers: Arc::new(AtomicU64::new(0)),
+            event_broadcast,
         }
     }
 
@@ -1243,5 +1847,549 @@ mod tests {
         assert_eq!(guess_mime("doc.pdf"), Some("application/pdf".to_string()));
         assert_eq!(guess_mime("video.mp4"), Some("video/mp4".to_string()));
         assert_eq!(guess_mime("unknown.xyz"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Milestone 17 — IPC & CLI expansion tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ipc_create_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let resp = process_request(
+            CliRequest::CreateFolder {
+                name: "Photos".to_string(),
+            },
+            &ctx,
+        );
+
+        match resp {
+            CliResponse::Ok { message } => {
+                assert!(message.contains("Photos"), "got: {message}");
+                assert!(message.contains("Folder created"), "got: {message}");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        // Folder should appear in list.
+        let resp2 = process_request(CliRequest::ListFolders, &ctx);
+        match resp2 {
+            CliResponse::Folders { folders } => {
+                // create_network auto-creates no folders, so only ours should be here.
+                assert!(
+                    folders.iter().any(|f| f.name == "Photos"),
+                    "Photos not found in: {folders:?}"
+                );
+            }
+            other => panic!("expected Folders, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ipc_list_folders_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let resp = process_request(CliRequest::ListFolders, &ctx);
+
+        match resp {
+            CliResponse::Folders { folders } => assert!(folders.is_empty()),
+            other => panic!("expected Folders, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ipc_subscribe_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        // Create a folder first.
+        let resp = process_request(
+            CliRequest::CreateFolder {
+                name: "Docs".to_string(),
+            },
+            &ctx,
+        );
+        let folder_id_hex = match resp {
+            CliResponse::Ok { message } => {
+                // Extract folder ID from message: "Folder created: Docs (<hex>)"
+                let paren_start = message.find('(').unwrap();
+                let paren_end = message.find(')').unwrap();
+                message[paren_start + 1..paren_end].to_string()
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        };
+
+        // Creator is already subscribed, but we can verify via ListFolders.
+        let resp2 = process_request(CliRequest::ListFolders, &ctx);
+        match resp2 {
+            CliResponse::Folders { folders } => {
+                let f = folders.iter().find(|f| f.name == "Docs").unwrap();
+                assert!(f.subscribed, "creator should be auto-subscribed");
+                assert_eq!(f.mode.as_deref(), Some("read-write"));
+            }
+            other => panic!("expected Folders, got {other:?}"),
+        }
+
+        // Unsubscribe, then re-subscribe as read-only.
+        let _ = process_request(
+            CliRequest::UnsubscribeFolder {
+                folder_id_hex: folder_id_hex.clone(),
+                keep_local: false,
+            },
+            &ctx,
+        );
+
+        let resp3 = process_request(
+            CliRequest::SubscribeFolder {
+                folder_id_hex: folder_id_hex.clone(),
+                local_path: "/tmp/test".to_string(),
+                mode: "read-only".to_string(),
+            },
+            &ctx,
+        );
+        match resp3 {
+            CliResponse::Ok { message } => {
+                assert!(message.contains("Subscribed"), "got: {message}");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        // Verify read-only subscription.
+        let resp4 = process_request(CliRequest::ListFolders, &ctx);
+        match resp4 {
+            CliResponse::Folders { folders } => {
+                let f = folders.iter().find(|f| f.name == "Docs").unwrap();
+                assert!(f.subscribed);
+                assert_eq!(f.mode.as_deref(), Some("read-only"));
+            }
+            other => panic!("expected Folders, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ipc_folder_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        // Create folder.
+        let resp = process_request(
+            CliRequest::CreateFolder {
+                name: "Music".to_string(),
+            },
+            &ctx,
+        );
+        let folder_id_hex = match resp {
+            CliResponse::Ok { message } => {
+                let paren_start = message.find('(').unwrap();
+                let paren_end = message.find(')').unwrap();
+                message[paren_start + 1..paren_end].to_string()
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        };
+
+        let resp2 = process_request(
+            CliRequest::FolderStatus {
+                folder_id_hex: folder_id_hex.clone(),
+            },
+            &ctx,
+        );
+        match resp2 {
+            CliResponse::FolderStatus {
+                name,
+                file_count,
+                conflict_count,
+                sync_status,
+                ..
+            } => {
+                assert_eq!(name, "Music");
+                assert_eq!(file_count, 0);
+                assert_eq!(conflict_count, 0);
+                assert_eq!(sync_status, "empty");
+            }
+            other => panic!("expected FolderStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ipc_folder_status_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let resp = process_request(
+            CliRequest::FolderStatus {
+                folder_id_hex: "aa".repeat(32),
+            },
+            &ctx,
+        );
+        match resp {
+            CliResponse::Error { message } => {
+                assert!(message.contains("not found"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ipc_list_conflicts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let resp = process_request(
+            CliRequest::ListConflicts {
+                folder_id_hex: None,
+            },
+            &ctx,
+        );
+        match resp {
+            CliResponse::Conflicts { conflicts } => assert!(conflicts.is_empty()),
+            other => panic!("expected Conflicts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ipc_resolve_nonexistent_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let resp = process_request(
+            CliRequest::ResolveConflict {
+                folder_id_hex: "aa".repeat(32),
+                path: "test.txt".to_string(),
+                chosen_hash_hex: "bb".repeat(32),
+            },
+            &ctx,
+        );
+        match resp {
+            CliResponse::Error { .. } => {} // Expected error.
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ipc_file_history_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let resp = process_request(
+            CliRequest::FileHistory {
+                folder_id_hex: "aa".repeat(32),
+                path: "test.txt".to_string(),
+            },
+            &ctx,
+        );
+        match resp {
+            CliResponse::FileVersions { versions } => assert!(versions.is_empty()),
+            other => panic!("expected FileVersions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ipc_set_folder_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        // Create a folder.
+        let resp = process_request(
+            CliRequest::CreateFolder {
+                name: "Setmode".to_string(),
+            },
+            &ctx,
+        );
+        let folder_id_hex = match resp {
+            CliResponse::Ok { message } => {
+                let paren_start = message.find('(').unwrap();
+                let paren_end = message.find(')').unwrap();
+                message[paren_start + 1..paren_end].to_string()
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        };
+
+        // Change mode to read-only.
+        let resp2 = process_request(
+            CliRequest::SetFolderMode {
+                folder_id_hex: folder_id_hex.clone(),
+                mode: "read-only".to_string(),
+            },
+            &ctx,
+        );
+        match resp2 {
+            CliResponse::Ok { message } => {
+                assert!(message.contains("read-only"), "got: {message}");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        // Verify mode changed.
+        let resp3 = process_request(CliRequest::ListFolders, &ctx);
+        match resp3 {
+            CliResponse::Folders { folders } => {
+                let f = folders.iter().find(|f| f.name == "Setmode").unwrap();
+                assert_eq!(f.mode.as_deref(), Some("read-only"));
+            }
+            other => panic!("expected Folders, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ipc_subscribe_nonexistent_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let resp = process_request(
+            CliRequest::SubscribeFolder {
+                folder_id_hex: "cc".repeat(32),
+                local_path: "/tmp/test".to_string(),
+                mode: "read-write".to_string(),
+            },
+            &ctx,
+        );
+        match resp {
+            CliResponse::Error { .. } => {} // Expected: folder doesn't exist.
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ipc_folder_files_after_add() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        // Create a folder.
+        let resp = process_request(
+            CliRequest::CreateFolder {
+                name: "TestFiles".to_string(),
+            },
+            &ctx,
+        );
+        let folder_id_hex = match resp {
+            CliResponse::Ok { message } => {
+                let paren_start = message.find('(').unwrap();
+                let paren_end = message.find(')').unwrap();
+                message[paren_start + 1..paren_end].to_string()
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        };
+
+        // Add a file via engine directly to this folder.
+        {
+            let mut eng = ctx.engine.lock().unwrap();
+            let folder_id = parse_folder_id(&folder_id_hex).unwrap();
+            let data = b"test content";
+            let blob_hash = murmur_types::BlobHash::from_data(data);
+            let meta = murmur_types::FileMetadata {
+                blob_hash,
+                folder_id,
+                path: "hello.txt".to_string(),
+                size: data.len() as u64,
+                mime_type: Some("text/plain".to_string()),
+                created_at: 1000,
+                modified_at: 1000,
+                device_origin: eng.device_id(),
+            };
+            eng.add_file(meta, data.to_vec()).unwrap();
+        }
+
+        // List folder files.
+        let resp2 = process_request(
+            CliRequest::FolderFiles {
+                folder_id_hex: folder_id_hex.clone(),
+            },
+            &ctx,
+        );
+        match resp2 {
+            CliResponse::Files { files } => {
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].path, "hello.txt");
+            }
+            other => panic!("expected Files, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_event_broadcast_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        // Subscribe to events.
+        let mut rx = ctx.event_broadcast.subscribe();
+
+        // Send an event through the broadcast channel.
+        let event = murmur_engine::EngineEvent::DagSynced { new_entries: 5 };
+        ctx.event_broadcast.send(event.clone()).unwrap();
+
+        // Receive the event.
+        let received = rx.blocking_recv().unwrap();
+        assert_eq!(received, event);
+    }
+
+    #[test]
+    fn test_engine_event_to_ipc_conversion() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let event = murmur_engine::EngineEvent::FolderCreated {
+            folder_id: FolderId::from_bytes([0xaa; 32]),
+            name: "TestFolder".to_string(),
+        };
+
+        let ipc = engine_event_to_ipc(&event, &ctx);
+        assert_eq!(ipc.event_type, "folder_created");
+        assert!(ipc.data.contains("TestFolder"));
+    }
+
+    #[test]
+    fn test_parse_folder_id_valid() {
+        let hex = "ab".repeat(32);
+        let id = parse_folder_id(&hex).unwrap();
+        assert_eq!(id, FolderId::from_bytes([0xab; 32]));
+    }
+
+    #[test]
+    fn test_parse_folder_id_invalid() {
+        assert!(parse_folder_id("too-short").is_err());
+        assert!(parse_folder_id(&"zz".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn test_parse_blob_hash_valid() {
+        let hex = "cd".repeat(32);
+        let hash = parse_blob_hash(&hex).unwrap();
+        assert_eq!(hash, BlobHash::from_bytes([0xcd; 32]));
+    }
+
+    #[test]
+    fn test_parse_blob_hash_invalid() {
+        assert!(parse_blob_hash("too-short").is_err());
+    }
+
+    #[test]
+    fn test_escape_json_special_chars() {
+        assert_eq!(escape_json("hello"), "hello");
+        assert_eq!(escape_json(r#"say "hi""#), r#"say \"hi\""#);
+        assert_eq!(escape_json("back\\slash"), "back\\\\slash");
+        assert_eq!(escape_json("line\nbreak"), "line\\nbreak");
+        assert_eq!(escape_json("tab\there"), "tab\\there");
+        assert_eq!(escape_json("return\rhere"), "return\\rhere");
+    }
+
+    #[test]
+    fn test_engine_event_to_ipc_escapes_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        // Path with double quotes — must produce valid JSON.
+        let event = murmur_engine::EngineEvent::FileSynced {
+            blob_hash: BlobHash::from_bytes([0xaa; 32]),
+            folder_id: FolderId::from_bytes([0xbb; 32]),
+            path: r#"dir/he said "hello".txt"#.to_string(),
+        };
+
+        let ipc = engine_event_to_ipc(&event, &ctx);
+        assert_eq!(ipc.event_type, "file_synced");
+        // The data field must be valid JSON — no unescaped quotes.
+        assert!(ipc.data.contains(r#"\"hello\""#), "got: {}", ipc.data);
+    }
+
+    #[test]
+    fn test_find_version_info_from_dag() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        // Create a folder and add a file.
+        let folder_id_hex;
+        let blob_hash;
+        let file_hlc;
+        {
+            let mut eng = ctx.engine.lock().unwrap();
+            let (folder, _) = eng.create_folder("History").unwrap();
+            folder_id_hex = folder.folder_id.to_string();
+
+            let data = b"version one";
+            blob_hash = murmur_types::BlobHash::from_data(data);
+            let meta = murmur_types::FileMetadata {
+                blob_hash,
+                folder_id: folder.folder_id,
+                path: "notes.txt".to_string(),
+                size: data.len() as u64,
+                mime_type: None,
+                created_at: 1000,
+                modified_at: 1000,
+                device_origin: eng.device_id(),
+            };
+            eng.add_file(meta, data.to_vec()).unwrap();
+
+            // Get the HLC from file history.
+            let history = eng.file_history(folder.folder_id, "notes.txt");
+            assert_eq!(history.len(), 1);
+            file_hlc = history[0].1;
+        }
+
+        // Now query file history via IPC and verify we get real device info.
+        let resp = process_request(
+            CliRequest::FileHistory {
+                folder_id_hex,
+                path: "notes.txt".to_string(),
+            },
+            &ctx,
+        );
+        match resp {
+            CliResponse::FileVersions { versions } => {
+                assert_eq!(versions.len(), 1);
+                let v = &versions[0];
+                assert_eq!(v.blob_hash, blob_hash.to_string());
+                assert_eq!(v.modified_at, file_hlc);
+                // Device name should be resolved, not "unknown".
+                assert_eq!(v.device_name, "TestDaemon");
+                assert_ne!(v.device_id, "unknown");
+                assert!(v.size > 0);
+            }
+            other => panic!("expected FileVersions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ipc_list_conflicts_with_folder_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        // Create two folders.
+        let resp1 = process_request(
+            CliRequest::CreateFolder {
+                name: "A".to_string(),
+            },
+            &ctx,
+        );
+        let fid_a = match resp1 {
+            CliResponse::Ok { message } => {
+                let s = message.find('(').unwrap();
+                let e = message.find(')').unwrap();
+                message[s + 1..e].to_string()
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        };
+
+        // List conflicts filtered by folder A — should return empty, not error.
+        let resp2 = process_request(
+            CliRequest::ListConflicts {
+                folder_id_hex: Some(fid_a),
+            },
+            &ctx,
+        );
+        match resp2 {
+            CliResponse::Conflicts { conflicts } => assert!(conflicts.is_empty()),
+            other => panic!("expected Conflicts, got {other:?}"),
+        }
+
+        // Invalid folder hex should return error.
+        let resp3 = process_request(
+            CliRequest::ListConflicts {
+                folder_id_hex: Some("bad-hex".to_string()),
+            },
+            &ctx,
+        );
+        assert!(matches!(resp3, CliResponse::Error { .. }));
     }
 }

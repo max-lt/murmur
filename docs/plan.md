@@ -12,8 +12,7 @@ For a feature overview, see [features.md](features.md).
 
 | Milestone                              | Status                                                                                                          |
 | -------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| 0–16                                   | ✅ Complete (Types, Seed, DAG, Network, Engine, Server, Integration Tests, Desktop App, FFI, Android, Daemon + CLI Split, Hardening, Folder Model & File Versioning, Conflict Detection & Resolution, Streaming Blob Storage & Transfer, Filesystem Watching & Ignore) |
-| 17 — IPC & CLI Expansion               | 🔲 Planned |
+| 0–17                                   | ✅ Complete (Types, Seed, DAG, Network, Engine, Server, Integration Tests, Desktop App, FFI, Android, Daemon + CLI Split, Hardening, Folder Model & File Versioning, Conflict Detection & Resolution, Streaming Blob Storage & Transfer, Filesystem Watching & Ignore, IPC & CLI Expansion) |
 | 18 — Desktop App (iced)                | 🔲 Planned |
 | 19 — Web Dashboard (htmx)              | 🔲 Planned |
 | 20 — Protocol Specification v0.1       | 🔲 Planned |
@@ -38,98 +37,6 @@ These decisions were agreed upon before implementation and guide all milestones 
 | Large files         | No hard size limit; streaming blake3, chunked storage/transfer, bounded memory      |
 | Web UI tech         | Server-rendered HTML with htmx, served by murmurd's axum server                     |
 | Protocol spec       | Phased: v0.1 alongside implementation, iterate as features stabilize                |
-
----
-
-## Milestone 17 — IPC & CLI Expansion
-
-**Crates**: `murmur-ipc`, `murmur-cli`, `murmurd`
-
-**Goal**: Expose all folder, conflict, subscription, and file history features via IPC. Extend the CLI
-with folder management commands. Add **event streaming** to IPC so that the desktop app and web UI
-can receive real-time updates without polling.
-
-**Event streaming**: New IPC flow — client sends `Subscribe` request, server keeps the connection open
-and pushes `Event` messages as they occur. This enables real-time UI updates in the desktop app (M18)
-and SSE in the web UI (M19).
-
-**New IPC types**:
-
-```rust
-// New requests
-CreateFolder { name: String },
-RemoveFolder { folder_id_hex: String },
-ListFolders,
-SubscribeFolder { folder_id_hex: String, local_path: String, mode: String },
-UnsubscribeFolder { folder_id_hex: String, keep_local: bool },
-FolderFiles { folder_id_hex: String },
-FolderStatus { folder_id_hex: String },
-ListConflicts,
-ResolveConflict { folder_id_hex: String, path: String, chosen_hash_hex: String },
-FileHistory { folder_id_hex: String, path: String },
-SetFolderMode { folder_id_hex: String, mode: String },
-SubscribeEvents,  // long-lived: server pushes EngineEvents
-
-// New responses
-Folders { folders: Vec<FolderInfoIpc> },
-FolderStatus { folder_id: String, name: String, file_count: u64, conflict_count: u64, sync_status: String },
-Conflicts { conflicts: Vec<ConflictInfoIpc> },
-FileVersions { versions: Vec<FileVersionIpc> },
-Event { event: EngineEventIpc },  // pushed to event subscribers
-
-// New IPC data types
-FolderInfoIpc { folder_id: String, name: String, created_by: String, file_count: u64, subscribed: bool, mode: Option<String> },
-ConflictInfoIpc { folder_id: String, folder_name: String, path: String, versions: Vec<ConflictVersionIpc> },
-ConflictVersionIpc { blob_hash: String, device_id: String, device_name: String, hlc: u64 },
-FileVersionIpc { blob_hash: String, device_id: String, device_name: String, modified_at: u64, size: u64 },
-EngineEventIpc { event_type: String, data: String },  // JSON-serialized event details
-```
-
-**New CLI commands**:
-
-```
-murmur-cli folder create <name>
-murmur-cli folder list
-murmur-cli folder subscribe <folder_id> <local_path> [--read-only]
-murmur-cli folder unsubscribe <folder_id> [--keep-local]
-murmur-cli folder files <folder_id>
-murmur-cli folder status <folder_id>
-murmur-cli folder remove <folder_id>
-murmur-cli folder mode <folder_id> <read-write|read-only>
-murmur-cli conflicts [--folder <folder_id>]
-murmur-cli resolve <folder_id> <path> <chosen_hash>
-murmur-cli history <folder_id> <path>
-```
-
-All commands support `--json` for machine-readable output.
-
-**Tasks**:
-
-- [ ] Add all new request/response variants to `murmur-ipc`
-- [ ] Add `FolderInfoIpc`, `ConflictInfoIpc`, `ConflictVersionIpc`, `FileVersionIpc` types
-- [ ] Implement event streaming: `SubscribeEvents` request → long-lived connection pushing `Event` responses
-- [ ] Wire up all new IPC requests in murmurd's IPC handler
-- [ ] Add `folder` subcommand group to `murmur-cli` (create, list, subscribe, unsubscribe, files, status, remove, mode)
-- [ ] Add `conflicts` command to `murmur-cli`
-- [ ] Add `resolve` command to `murmur-cli`
-- [ ] Add `history` command to `murmur-cli`
-- [ ] `--json` support for all new commands
-- [ ] Update `CLAUDE.md` with new IPC protocol and CLI commands
-
-**Tests** (≥10):
-
-- [ ] IPC round-trip: `CreateFolder` → `Folders` response with new folder
-- [ ] IPC round-trip: `SubscribeFolder` → `Ok` response
-- [ ] IPC round-trip: `ListFolders` returns correct folder list
-- [ ] IPC round-trip: `ListConflicts` returns correct conflicts
-- [ ] IPC round-trip: `ResolveConflict` → `Ok` + conflict removed
-- [ ] IPC round-trip: `FileHistory` returns version chain
-- [ ] IPC round-trip: `FolderStatus` returns correct counts
-- [ ] Event streaming: client receives `Event` when DAG entry is created
-- [ ] CLI `folder create` + `folder list` — end-to-end
-- [ ] CLI `--json` output parses as valid JSON
-- [ ] Error handling: subscribe to non-existent folder → `Error` response
-- [ ] Error handling: resolve non-existent conflict → `Error` response
 
 ---
 
