@@ -1,6 +1,8 @@
 /target
 *.local.json
 
+/internal
+
 # Android build artifacts
 platforms/android/.gradle/
 platforms/android/build/
