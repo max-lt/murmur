@@ -95,6 +95,7 @@ pub struct App {
     pub(crate) cfg_upload_throttle: u64,
     pub(crate) cfg_download_throttle: u64,
     pub(crate) settings_toast: Option<String>,
+    pub(crate) cfg_mnemonic: String,
     // Folder settings
     pub(crate) folder_ignore_patterns: String,
     // Folder rename state
@@ -164,6 +165,7 @@ impl App {
             cfg_upload_throttle: 0,
             cfg_download_throttle: 0,
             settings_toast: None,
+            cfg_mnemonic: String::new(),
             folder_ignore_patterns: String::new(),
             renaming_folder_id: None,
             rename_input: String::new(),
@@ -303,6 +305,13 @@ impl App {
         Task::perform(
             ipc::send(self.socket_path.clone(), CliRequest::GetConfig),
             Message::GotConfig,
+        )
+    }
+
+    pub fn fetch_mnemonic(&self) -> Task<Message> {
+        Task::perform(
+            ipc::send(self.socket_path.clone(), CliRequest::ShowMnemonic),
+            Message::GotMnemonic,
         )
     }
 

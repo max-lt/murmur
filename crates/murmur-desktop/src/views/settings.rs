@@ -30,6 +30,27 @@ impl App {
         .style(card_style);
         col = col.push(device_card);
 
+        // Mnemonic card
+        if !self.cfg_mnemonic.is_empty() {
+            let mnemonic_card = container(
+                column![
+                    text("Network Mnemonic").size(16).color(TEXT_SECONDARY),
+                    text(&self.cfg_mnemonic)
+                        .size(13)
+                        .color(Color::WHITE),
+                    button(text("Copy to Clipboard").size(13))
+                        .on_press(Message::CopyMnemonic)
+                        .style(secondary_btn)
+                        .padding(6),
+                ]
+                .spacing(6),
+            )
+            .padding(14)
+            .width(Length::Fill)
+            .style(card_style);
+            col = col.push(mnemonic_card);
+        }
+
         // Network card
         let network_card = container(
             column![

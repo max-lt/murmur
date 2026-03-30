@@ -88,6 +88,9 @@ pub enum Message {
     ReclaimOrphanedBlobs,
     FolderIgnorePatternsChanged(String),
     SaveIgnorePatterns(String),
+    // Mnemonic
+    GotMnemonic(Result<CliResponse, String>),
+    CopyMnemonic,
     // Leave network
     LeaveNetworkStart,
     LeaveNetworkConfirm,

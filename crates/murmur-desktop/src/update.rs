@@ -104,7 +104,9 @@ impl App {
                     Screen::Conflicts => self.fetch_conflicts(),
                     Screen::Devices => Task::batch([self.fetch_devices(), self.fetch_presence()]),
                     Screen::Status => self.fetch_status(),
-                    Screen::Settings => self.fetch_config(),
+                    Screen::Settings => {
+                        Task::batch([self.fetch_config(), self.fetch_mnemonic()])
+                    }
                     Screen::NetworkHealth => {
                         Task::batch([self.fetch_peers(), self.fetch_storage_stats()])
                     }
@@ -161,6 +163,14 @@ impl App {
                 self.cfg_download_throttle = download_throttle;
                 self.sync_paused = sync_paused;
                 self.status_device_name = device_name;
+            }
+            Message::GotMnemonic(Ok(CliResponse::Mnemonic { mnemonic })) => {
+                self.cfg_mnemonic = mnemonic;
+            }
+            Message::CopyMnemonic => {
+                if !self.cfg_mnemonic.is_empty() {
+                    return iced::clipboard::write(self.cfg_mnemonic.clone());
+                }
             }
             Message::GotIgnorePatterns(Ok(CliResponse::IgnorePatterns { patterns })) => {
                 self.folder_ignore_patterns = patterns;
@@ -632,6 +642,7 @@ impl App {
             | Message::GotFileHistory(Err(e))
             | Message::GotGeneric(Err(e))
             | Message::GotConfig(Err(e))
+            | Message::GotMnemonic(Err(e))
             | Message::GotIgnorePatterns(Err(e))
             | Message::GotPeers(Err(e))
             | Message::GotStorageStats(Err(e))
