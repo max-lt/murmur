@@ -460,6 +460,7 @@ fn run_daemon(
             event_broadcast: ipc_event_tx,
             synced_folders: synced_folders_arc.clone(),
             base_dir: base_dir.to_path_buf(),
+            endpoint: Some(net_handle.endpoint().clone()),
             config: Arc::new(Mutex::new(config.clone())),
             sync_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             paused_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -592,6 +593,8 @@ struct DaemonCtx {
     paused_folders: Arc<Mutex<std::collections::HashSet<FolderId>>>,
     /// Per-device presence (M23a): device_id → (online, last_seen_unix).
     device_presence: Arc<Mutex<std::collections::HashMap<DeviceId, (bool, u64)>>>,
+    /// Iroh endpoint for connectivity checks (None only in tests).
+    endpoint: Option<iroh::Endpoint>,
 }
 
 /// Handle a single CLI connection.
@@ -1847,13 +1850,22 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
             }
         }
         CliRequest::RunConnectivityCheck => {
-            // Simple connectivity check: we report based on known peer count.
-            let peer_count = ctx.connected_peers.load(Ordering::Relaxed);
-            let reachable = peer_count > 0;
-            let latency_ms = if reachable { Some(1) } else { None };
-            CliResponse::ConnectivityResult {
-                relay_reachable: reachable,
-                latency_ms,
+            if let Some(ref endpoint) = ctx.endpoint {
+                // Check if the endpoint has a relay URL in its address
+                // (meaning it successfully connected to a relay server).
+                let addr = endpoint.addr();
+                let relay_urls: Vec<_> = addr.relay_urls().collect();
+                let relay_reachable = !relay_urls.is_empty();
+                let latency_ms = if relay_reachable { Some(0) } else { None };
+                CliResponse::ConnectivityResult {
+                    relay_reachable,
+                    latency_ms,
+                }
+            } else {
+                CliResponse::ConnectivityResult {
+                    relay_reachable: false,
+                    latency_ms: None,
+                }
             }
         }
         CliRequest::ExportDiagnostics { output_path } => {
@@ -2467,6 +2479,7 @@ mod tests {
             sync_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             paused_folders: Arc::new(Mutex::new(std::collections::HashSet::new())),
             device_presence: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            endpoint: None,
         }
     }
 

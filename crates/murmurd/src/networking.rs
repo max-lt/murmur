@@ -46,6 +46,11 @@ pub struct NetworkHandle {
 }
 
 impl NetworkHandle {
+    /// Returns a clone of the iroh endpoint for connectivity checks.
+    pub fn endpoint(&self) -> &iroh::Endpoint {
+        &self.endpoint
+    }
+
     /// Gracefully close the iroh endpoint and abort background tasks.
     pub async fn close(self) {
         for handle in &self.background_tasks {
