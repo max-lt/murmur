@@ -21,6 +21,61 @@ pub struct Config {
     /// Folder directory mappings.
     #[serde(default)]
     pub folders: Vec<FolderConfig>,
+    /// Per-event notification preferences (M31).
+    #[serde(default)]
+    pub notifications: NotificationSettings,
+}
+
+/// Per-event notification preferences (M31).
+///
+/// Each flag gates whether a class of events surfaces as a tray notification.
+/// Defaults are all-on to match the previous "always notify" behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationSettings {
+    /// Notify when a conflict is detected.
+    #[serde(default = "default_true")]
+    pub conflict: bool,
+    /// Notify when a transfer completes.
+    #[serde(default = "default_true")]
+    pub transfer_completed: bool,
+    /// Notify when a new device joins or is approved.
+    #[serde(default = "default_true")]
+    pub device_joined: bool,
+    /// Notify on errors.
+    #[serde(default = "default_true")]
+    pub error: bool,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self {
+            conflict: true,
+            transfer_completed: true,
+            device_joined: true,
+            error: true,
+        }
+    }
+}
+
+impl NotificationSettings {
+    /// Return the per-event flag corresponding to an engine event type
+    /// (the name used in `EngineEventIpc::event_type`). Unknown events
+    /// default to on — if the tray ever grows to notify about new events,
+    /// the fail-safe is "surface the event".
+    ///
+    /// The desktop process performs the same routing client-side today,
+    /// but this helper lets daemon-side code (future tray/http bridge)
+    /// gate emission before it hits the wire.
+    #[allow(dead_code)]
+    pub fn is_enabled(&self, event_type: &str) -> bool {
+        match event_type {
+            "conflict_detected" | "conflict_auto_resolved" => self.conflict,
+            "file_synced" | "blob_received" => self.transfer_completed,
+            "device_join_requested" | "device_approved" => self.device_joined,
+            "error" => self.error,
+            _ => true,
+        }
+    }
 }
 
 /// A folder's local directory mapping.
@@ -51,6 +106,14 @@ pub struct FolderConfig {
     /// expiry tick.
     #[serde(default)]
     pub conflict_expiry_days: Option<u64>,
+    /// Per-device cosmetic color (hex string, e.g. `"#4f8cff"`). M31.
+    ///
+    /// Not shared across the network — lives in local config only.
+    #[serde(default)]
+    pub color_hex: Option<String>,
+    /// Per-device cosmetic icon slug or emoji. M31.
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -136,6 +199,7 @@ impl Config {
             },
             network: NetworkConfig::default(),
             folders: Vec::new(),
+            notifications: NotificationSettings::default(),
         }
     }
 
@@ -303,6 +367,66 @@ local_path = "/home/user/Sync/Photos"
         assert_eq!(config.folders[0].mode, "full");
         // name defaults to empty when omitted from TOML (backwards compat).
         assert_eq!(config.folders[0].name, "");
+    }
+
+    #[test]
+    fn test_config_folder_color_icon_roundtrip() {
+        // M31: per-folder cosmetic color/icon persist across save/load.
+        let mut config = Config::new(Path::new("/data/murmur"), "Home NAS");
+        config.folders.push(FolderConfig {
+            folder_id: "aa".repeat(32),
+            name: "Photos".to_string(),
+            local_path: PathBuf::from("/data/photos"),
+            mode: "full".to_string(),
+            auto_resolve: "none".to_string(),
+            conflict_expiry_days: None,
+            color_hex: Some("#4f8cff".to_string()),
+            icon: Some("photos".to_string()),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        config.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn test_config_notifications_default_all_on() {
+        // M31: absence of a `[notifications]` section defaults to all-on
+        // so existing configs keep their current notify-everything behaviour.
+        let toml_str = r#"
+[device]
+name = "NAS"
+
+[storage]
+blob_dir = "/data/blobs"
+data_dir = "/data/db"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.notifications.conflict);
+        assert!(config.notifications.transfer_completed);
+        assert!(config.notifications.device_joined);
+        assert!(config.notifications.error);
+    }
+
+    #[test]
+    fn test_notification_settings_is_enabled_routing() {
+        // M31: event_type strings route to the right preference flag.
+        let settings = NotificationSettings {
+            conflict: false,
+            transfer_completed: true,
+            device_joined: false,
+            error: true,
+        };
+        assert!(!settings.is_enabled("conflict_detected"));
+        assert!(!settings.is_enabled("conflict_auto_resolved"));
+        assert!(settings.is_enabled("file_synced"));
+        assert!(settings.is_enabled("blob_received"));
+        assert!(!settings.is_enabled("device_join_requested"));
+        assert!(!settings.is_enabled("device_approved"));
+        assert!(settings.is_enabled("error"));
+        // Unknown events default to on (fail-safe: surface new events).
+        assert!(settings.is_enabled("some_new_event"));
     }
 
     #[test]

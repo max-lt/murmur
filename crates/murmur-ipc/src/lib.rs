@@ -339,6 +339,32 @@ pub enum CliRequest {
         /// Days until unresolved conflicts are auto-resolved. `0` disables.
         days: u64,
     },
+
+    // -- M31: Sync Progress & Desktop UX Polish --
+    /// Set a per-folder cosmetic color (hex, e.g. `"#4f8cff"`). `None` clears.
+    ///
+    /// Stored in the local `config.toml` (not the DAG) since color/icon are
+    /// per-device cosmetic preferences, not shared-network state.
+    SetFolderColor {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// CSS-style hex color, or `None` to clear.
+        color_hex: Option<String>,
+    },
+    /// Set a per-folder icon identifier (short slug or emoji). `None` clears.
+    SetFolderIcon {
+        /// Folder ID as 64-character hex string.
+        folder_id_hex: String,
+        /// Icon slug/emoji, or `None` to clear.
+        icon: Option<String>,
+    },
+    /// Query the current notification-preference settings.
+    GetNotificationSettings,
+    /// Replace the notification-preference settings.
+    SetNotificationSettings {
+        /// The new settings to persist.
+        settings: NotificationSettingsIpc,
+    },
 }
 
 /// A response sent from `murmurd` to `murmur-cli`.
@@ -547,6 +573,13 @@ pub enum CliResponse {
         /// Right (second) side of the conflict.
         right: ConflictDiffSide,
     },
+
+    // -- M31: Sync Progress & Desktop UX Polish --
+    /// Notification preferences (response to [`CliRequest::GetNotificationSettings`]).
+    NotificationSettings {
+        /// The current notification settings.
+        settings: NotificationSettingsIpc,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -582,6 +615,11 @@ pub struct FileInfoIpc {
 }
 
 /// Blob transfer status for IPC transport.
+///
+/// Computed daemon-side so that all clients (desktop, CLI, mobile) render
+/// identical numbers. The smoothed speed uses an EWMA (α ≈ 0.2) against a
+/// running baseline — naive `bytes/elapsed` is too jittery on real networks
+/// to produce useful ETAs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TransferInfoIpc {
     /// Blob hash (hex).
@@ -590,6 +628,18 @@ pub struct TransferInfoIpc {
     pub bytes_transferred: u64,
     /// Total blob size in bytes.
     pub total_bytes: u64,
+    /// UNIX timestamp (seconds) when the transfer was first observed.
+    #[serde(default)]
+    pub started_at_unix: u64,
+    /// UNIX timestamp (seconds) of the most recent progress sample.
+    #[serde(default)]
+    pub last_progress_unix: u64,
+    /// Smoothed transfer speed in bytes/sec (EWMA over progress samples).
+    #[serde(default)]
+    pub bytes_per_sec_smoothed: u64,
+    /// Estimated seconds until completion, or `None` when insufficient data.
+    #[serde(default)]
+    pub eta_seconds: Option<u64>,
 }
 
 /// Folder information for IPC transport.
@@ -612,6 +662,12 @@ pub struct FolderInfoIpc {
     /// Short sync status label (e.g. "Up to date", "Syncing", "Paused", "Conflicts").
     #[serde(default)]
     pub sync_status: String,
+    /// Per-device cosmetic color (hex string, e.g. `"#4f8cff"`). M31.
+    #[serde(default)]
+    pub color_hex: Option<String>,
+    /// Per-device cosmetic icon slug or emoji. M31.
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 /// Conflict information for IPC transport.
@@ -680,6 +736,40 @@ pub struct FolderConfigIpc {
     /// Days until unresolved conflicts auto-resolve. `None` = disabled (M29).
     #[serde(default)]
     pub conflict_expiry_days: Option<u64>,
+    /// Per-device cosmetic color (hex string, e.g. `"#4f8cff"`). M31.
+    #[serde(default)]
+    pub color_hex: Option<String>,
+    /// Per-device cosmetic icon slug or emoji. M31.
+    #[serde(default)]
+    pub icon: Option<String>,
+}
+
+/// Notification preferences for IPC transport (M31).
+///
+/// Each toggle controls whether a given engine event is allowed to surface
+/// a tray notification. Clients persist these in local config so they
+/// survive daemon restarts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationSettingsIpc {
+    /// Notify when a conflict is detected.
+    pub conflict: bool,
+    /// Notify when a transfer completes.
+    pub transfer_completed: bool,
+    /// Notify when a new device joins or is approved.
+    pub device_joined: bool,
+    /// Notify on errors surfaced by the daemon.
+    pub error: bool,
+}
+
+impl Default for NotificationSettingsIpc {
+    fn default() -> Self {
+        Self {
+            conflict: true,
+            transfer_completed: true,
+            device_joined: true,
+            error: true,
+        }
+    }
 }
 
 /// One side of a conflict diff for IPC transport (M29).
@@ -1020,6 +1110,24 @@ mod tests {
                 folder_id_hex: "bb".repeat(32),
                 days: 7,
             },
+            // M31
+            CliRequest::SetFolderColor {
+                folder_id_hex: "cc".repeat(32),
+                color_hex: Some("#4f8cff".to_string()),
+            },
+            CliRequest::SetFolderIcon {
+                folder_id_hex: "dd".repeat(32),
+                icon: Some("photos".to_string()),
+            },
+            CliRequest::GetNotificationSettings,
+            CliRequest::SetNotificationSettings {
+                settings: NotificationSettingsIpc {
+                    conflict: true,
+                    transfer_completed: false,
+                    device_joined: true,
+                    error: false,
+                },
+            },
         ];
         for req in variants {
             let bytes = postcard::to_allocvec(&req).unwrap();
@@ -1086,6 +1194,8 @@ mod tests {
                 mode: Some("read-write".to_string()),
                 local_path: Some("/home/user/Photos".to_string()),
                 sync_status: "Up to date".to_string(),
+                color_hex: Some("#4f8cff".to_string()),
+                icon: Some("photos".to_string()),
             }],
         };
         let bytes = postcard::to_allocvec(&resp).unwrap();
@@ -1181,6 +1291,10 @@ mod tests {
                     blob_hash: "dd".repeat(32),
                     bytes_transferred: 512,
                     total_bytes: 1024,
+                    started_at_unix: 1_711_700_000,
+                    last_progress_unix: 1_711_700_015,
+                    bytes_per_sec_smoothed: 34,
+                    eta_seconds: Some(15),
                 }],
             },
             CliResponse::Error {
@@ -1216,6 +1330,8 @@ mod tests {
                     mode: "read-write".to_string(),
                     auto_resolve: "none".to_string(),
                     conflict_expiry_days: None,
+                    color_hex: None,
+                    icon: None,
                 }],
                 auto_approve: false,
                 mdns: true,
@@ -1309,6 +1425,10 @@ mod tests {
                     size: 13,
                     bytes: b"hello, world\n".to_vec(),
                 },
+            },
+            // M31
+            CliResponse::NotificationSettings {
+                settings: NotificationSettingsIpc::default(),
             },
         ];
         for resp in variants {
@@ -1437,9 +1557,13 @@ mod tests {
             mode: None,
             local_path: None,
             sync_status: String::new(),
+            color_hex: None,
+            icon: None,
         };
         let bytes = postcard::to_allocvec(&info).unwrap();
-        let expected = "0161016201630000000000";
+        // Trailing `0000` accounts for the two Option::None slots added in
+        // M31 (color_hex, icon).
+        let expected = "01610162016300000000000000";
         assert_eq!(
             hex(&bytes),
             expected,
@@ -1452,46 +1576,31 @@ mod tests {
         // If someone adds or removes a CliResponse variant, this test
         // forces them to also update the golden-byte tests above.
         //
-        // Last variant is now ConflictDiff at index 25 (0x19). Payload:
-        // - is_text: true → 0x01
-        // - left: blob_hash "" (0x00), device_name "" (0x00), size 0 (0x00),
-        //   bytes [] (0x00)
-        // - right: same → "00000000"
-        let last = CliResponse::ConflictDiff {
-            is_text: true,
-            left: ConflictDiffSide {
-                blob_hash: String::new(),
-                device_name: String::new(),
-                size: 0,
-                bytes: Vec::new(),
-            },
-            right: ConflictDiffSide {
-                blob_hash: String::new(),
-                device_name: String::new(),
-                size: 0,
-                bytes: Vec::new(),
-            },
+        // Last variant is now NotificationSettings at index 26 (0x1a). Payload:
+        // four `bool` fields (conflict, transfer_completed, device_joined,
+        // error) all true → "01 01 01 01".
+        let last = CliResponse::NotificationSettings {
+            settings: NotificationSettingsIpc::default(),
         };
         let bytes = postcard::to_allocvec(&last).unwrap();
         assert_eq!(
             hex(&bytes),
-            "19010000000000000000",
+            "1a01010101",
             "CliResponse variant count changed — update golden-byte tests for new variants"
         );
     }
 
     #[test]
     fn test_request_variant_count_guard() {
-        // Last variant is now SetConflictExpiry at index 53 (0x35). Payload:
-        // folder_id_hex "" (0x00), days 0 (0x00).
-        let last = CliRequest::SetConflictExpiry {
-            folder_id_hex: String::new(),
-            days: 0,
+        // Last variant is now SetNotificationSettings at index 57 (0x39).
+        // Payload: four `bool` fields (all true) → "01 01 01 01".
+        let last = CliRequest::SetNotificationSettings {
+            settings: NotificationSettingsIpc::default(),
         };
         let bytes = postcard::to_allocvec(&last).unwrap();
         assert_eq!(
             hex(&bytes),
-            "350000",
+            "3901010101",
             "CliRequest variant count changed — update golden-byte tests for new variants"
         );
     }

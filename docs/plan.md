@@ -25,7 +25,7 @@ For a feature overview, see [features.md](features.md).
 | 27 — Diagnostics & Network Health                                | ✅ Done    |
 | 29 — Conflict Resolution Improvements                            | ✅ Done    |
 | 30 — Onboarding                                                  | ✅ Done    |
-| 31 — Sync Progress & Desktop UX Polish                           | 🔲 Planned |
+| 31 — Sync Progress & Desktop UX Polish                           | ✅ Done    |
 | 32 — Miscellaneous Quality-of-Life                               | 🔲 Planned |
 | 33 — Cross-Platform Desktop Builds & Distribution                | 🔲 Planned |
 | 34 — iOS App                                                     | 🔲 Planned |

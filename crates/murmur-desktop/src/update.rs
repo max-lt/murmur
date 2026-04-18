@@ -7,7 +7,7 @@ use murmur_ipc::{CliRequest, CliResponse};
 use crate::app::{App, Screen, SetupStep, StorageStatsCache};
 use crate::helpers::{dirs_home, format_size, pick_directory};
 use crate::ipc;
-use crate::message::Message;
+use crate::message::{Message, NotificationKind};
 
 impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -173,6 +173,8 @@ impl App {
                         .conflict_expiry_days
                         .map(|d| d.to_string())
                         .unwrap_or_default();
+                    self.folder_color_input = fc.color_hex.clone().unwrap_or_default();
+                    self.folder_icon_input = fc.icon.clone().unwrap_or_default();
                 }
             }
             Message::GotMnemonic(Ok(CliResponse::Mnemonic { mnemonic })) => {
@@ -789,9 +791,19 @@ impl App {
             }
             // Events
             Message::DaemonEvent(CliResponse::Event { event }) => {
-                self.push_event(format!("{}: {}", event.event_type, event.data));
+                // Activity feed is always full-fidelity (M31).
+                self.push_activity(
+                    event.event_type.clone(),
+                    format!("{}: {}", event.event_type, event.data),
+                );
+                // "Tray"-style notifications respect the per-event toggles.
+                self.push_notification(
+                    &event.event_type,
+                    format!("{}: {}", event.event_type, event.data),
+                );
                 match event.event_type.as_str() {
                     "file_synced" | "dag_synced" => return self.fetch_folders(),
+                    "blob_transfer_progress" | "blob_received" => return self.fetch_transfers(),
                     "conflict_detected" | "conflict_auto_resolved" => {
                         return self.fetch_conflicts();
                     }
@@ -806,7 +818,117 @@ impl App {
                     _ => {}
                 }
             }
-            Message::Tick => return self.fetch_status(),
+            Message::Tick => {
+                return Task::batch([self.fetch_status(), self.fetch_transfers()]);
+            }
+            // M31: Sync Progress & Desktop UX Polish
+            Message::GotNotificationSettings(Ok(CliResponse::NotificationSettings {
+                settings,
+            })) => {
+                self.notification_settings = settings;
+            }
+            Message::GotTransfers(Ok(CliResponse::TransferStatus { transfers })) => {
+                self.transfers = transfers;
+            }
+            Message::ToggleNotification(kind) => {
+                match kind {
+                    NotificationKind::Conflict => {
+                        self.notification_settings.conflict = !self.notification_settings.conflict;
+                    }
+                    NotificationKind::TransferCompleted => {
+                        self.notification_settings.transfer_completed =
+                            !self.notification_settings.transfer_completed;
+                    }
+                    NotificationKind::DeviceJoined => {
+                        self.notification_settings.device_joined =
+                            !self.notification_settings.device_joined;
+                    }
+                    NotificationKind::Error => {
+                        self.notification_settings.error = !self.notification_settings.error;
+                    }
+                }
+                let s = self.socket_path.clone();
+                let settings = self.notification_settings.clone();
+                return Task::perform(
+                    ipc::send(s, CliRequest::SetNotificationSettings { settings }),
+                    Message::GotGeneric,
+                );
+            }
+            Message::FolderFileDropped(path) => {
+                // Only the folder-detail screen accepts drops; ignore
+                // otherwise so dropping files on other views is a no-op.
+                if self.screen != Screen::FolderDetail {
+                    return Task::none();
+                }
+                let Some(folder) = self.selected_folder.clone() else {
+                    return Task::none();
+                };
+                let Some(local) = folder.local_path.clone() else {
+                    return Task::none();
+                };
+                let filename = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if filename.is_empty() {
+                    return Task::none();
+                }
+                let dest = std::path::PathBuf::from(&local).join(&filename);
+                if let Err(e) = std::fs::copy(&path, &dest) {
+                    tracing::warn!(
+                        error = %e,
+                        src = %path.display(),
+                        dst = %dest.display(),
+                        "drop copy failed",
+                    );
+                    return Task::none();
+                }
+                // The folder watcher picks the file up from disk and drives
+                // `FileAdded` through forward sync. We deliberately avoid
+                // `CliRequest::AddFile` here because it targets the "default"
+                // folder rather than `folder.folder_id`.
+                self.push_event(format!("dropped: {filename}"));
+            }
+            Message::FolderColorInputChanged(s) => self.folder_color_input = s,
+            Message::FolderIconInputChanged(s) => self.folder_icon_input = s,
+            Message::SaveFolderColor { folder_id } => {
+                let value = self.folder_color_input.trim();
+                let color_hex = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                let s = self.socket_path.clone();
+                return Task::perform(
+                    ipc::send(
+                        s,
+                        CliRequest::SetFolderColor {
+                            folder_id_hex: folder_id,
+                            color_hex,
+                        },
+                    ),
+                    Message::GotGeneric,
+                );
+            }
+            Message::SaveFolderIcon { folder_id } => {
+                let value = self.folder_icon_input.trim();
+                let icon = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                let s = self.socket_path.clone();
+                return Task::perform(
+                    ipc::send(
+                        s,
+                        CliRequest::SetFolderIcon {
+                            folder_id_hex: folder_id,
+                            icon,
+                        },
+                    ),
+                    Message::GotGeneric,
+                );
+            }
             // Error handling
             Message::GotStatus(Err(e))
             | Message::GotFolders(Err(e))
@@ -825,7 +947,9 @@ impl App {
             | Message::GotPeers(Err(e))
             | Message::GotStorageStats(Err(e))
             | Message::GotConnectivity(Err(e))
-            | Message::GotReclaim(Err(e)) => {
+            | Message::GotReclaim(Err(e))
+            | Message::GotNotificationSettings(Err(e))
+            | Message::GotTransfers(Err(e)) => {
                 tracing::warn!(error = %e, "IPC error response");
                 if self.daemon_running == Some(true) {
                     self.daemon_error = Some(e);

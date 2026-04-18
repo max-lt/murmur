@@ -13,6 +13,7 @@ mod metrics;
 mod networking;
 mod storage;
 mod sync;
+mod transfers;
 mod watcher;
 
 use std::os::unix::net::UnixListener;
@@ -36,6 +37,7 @@ use zeroize::Zeroize;
 use config::Config;
 use storage::{FjallPlatform, Storage};
 use sync::SyncedFolder;
+use transfers::TransferTracker;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -332,6 +334,11 @@ fn run_daemon(base_dir: &Path, default_name: &str, http_port: Option<u16>) -> Re
         let (ipc_event_tx, _) = tokio::sync::broadcast::channel::<murmur_engine::EngineEvent>(256);
         let ipc_event_tx_for_forward = ipc_event_tx.clone();
 
+        // M31: live transfer tracker (EWMA speed / ETA). Shared between the
+        // event-forwarding task (writer) and `TransferStatus` IPC (reader).
+        let transfer_tracker = Arc::new(TransferTracker::new());
+        let transfer_tracker_for_events = transfer_tracker.clone();
+
         // Set up filesystem watching and sync for configured folders.
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         platform_ref.set_event_tx(event_tx);
@@ -447,6 +454,27 @@ fn run_daemon(base_dir: &Path, default_name: &str, http_port: Option<u16>) -> Re
                 // Forward to IPC event subscribers (best-effort, ignore if no subscribers).
                 let _ = ipc_event_tx_for_forward.send(event.clone());
 
+                // M31: feed blob-transfer progress samples into the tracker so
+                // `TransferStatus` returns smoothed speed / ETA.
+                if let murmur_engine::EngineEvent::BlobTransferProgress {
+                    blob_hash,
+                    bytes_transferred,
+                    total_bytes,
+                } = &event
+                {
+                    transfer_tracker_for_events.record(
+                        *blob_hash,
+                        *bytes_transferred,
+                        *total_bytes,
+                    );
+                    if *total_bytes > 0 && bytes_transferred >= total_bytes {
+                        transfer_tracker_for_events.remove(blob_hash);
+                    }
+                }
+                if let murmur_engine::EngineEvent::BlobReceived { blob_hash } = &event {
+                    transfer_tracker_for_events.remove(blob_hash);
+                }
+
                 match sync::handle_reverse_sync_event(
                     &event,
                     &folders_for_reverse,
@@ -543,6 +571,7 @@ fn run_daemon(base_dir: &Path, default_name: &str, http_port: Option<u16>) -> Re
             used_invite_nonces: Arc::new(Mutex::new(std::collections::HashSet::new())),
             signing_key: Arc::new(ctx_signing_key.clone()),
             device_id,
+            transfer_tracker: transfer_tracker.clone(),
         });
 
         // Spawn conflict-expiry tick (M29). Periodically scans folder
@@ -706,6 +735,8 @@ struct DaemonCtx {
     signing_key: Arc<ed25519_dalek::SigningKey>,
     /// This daemon's device ID — identifies the invite issuer.
     device_id: DeviceId,
+    /// Live in-flight transfer stats with smoothed speed / ETA (M31).
+    transfer_tracker: Arc<TransferTracker>,
 }
 
 /// Handle a single CLI connection.
@@ -868,6 +899,9 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                     };
                 }
             };
+            // Merge pending push-queue entries (we know total size but not
+            // progress) with the live tracker (smoothed progress samples from
+            // BlobTransferProgress events).
             let transfers = items
                 .into_iter()
                 .map(|(blob_hash, _retry_count)| {
@@ -875,10 +909,37 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                         Ok(Some(data)) => data.len() as u64,
                         _ => 0,
                     };
+                    let stats = ctx.transfer_tracker.get(&blob_hash);
+                    let (
+                        bytes_transferred,
+                        started_at_unix,
+                        last_progress_unix,
+                        bytes_per_sec_smoothed,
+                        eta_seconds,
+                        total,
+                    ) = match stats {
+                        Some(s) => (
+                            s.bytes_transferred,
+                            s.started_at_unix,
+                            s.last_progress_unix,
+                            s.bytes_per_sec_smoothed.round() as u64,
+                            s.eta_seconds(),
+                            if s.total_bytes > 0 {
+                                s.total_bytes
+                            } else {
+                                total_bytes
+                            },
+                        ),
+                        None => (0, 0, 0, 0, None, total_bytes),
+                    };
                     TransferInfoIpc {
                         blob_hash: blob_hash.to_string(),
-                        bytes_transferred: 0,
-                        total_bytes,
+                        bytes_transferred,
+                        total_bytes: total,
+                        started_at_unix,
+                        last_progress_unix,
+                        bytes_per_sec_smoothed,
+                        eta_seconds,
                     }
                 })
                 .collect();
@@ -913,6 +974,8 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                                 mode: SyncMode::Full.as_str().to_string(),
                                 auto_resolve: "none".to_string(),
                                 conflict_expiry_days: None,
+                                color_hex: None,
+                                icon: None,
                             });
                             persist_config(ctx, &cfg);
                         }
@@ -1063,6 +1126,9 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                             "Up to date".to_string()
                         }
                     };
+                    let (color_hex, icon) = fc
+                        .map(|fc| (fc.color_hex.clone(), fc.icon.clone()))
+                        .unwrap_or((None, None));
                     FolderInfoIpc {
                         folder_id: fid_str,
                         name,
@@ -1072,6 +1138,8 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                         mode: sub.map(|s| s.mode.as_str().to_string()),
                         local_path,
                         sync_status,
+                        color_hex,
+                        icon,
                     }
                 })
                 .collect();
@@ -1124,6 +1192,8 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                                 mode: mode.clone(),
                                 auto_resolve: "none".to_string(),
                                 conflict_expiry_days: None,
+                                color_hex: None,
+                                icon: None,
                             });
                         }
                         persist_config(ctx, &cfg);
@@ -1432,6 +1502,8 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                     mode: f.mode.clone(),
                     auto_resolve: f.auto_resolve.clone(),
                     conflict_expiry_days: f.conflict_expiry_days,
+                    color_hex: f.color_hex.clone(),
+                    icon: f.icon.clone(),
                 })
                 .collect();
             CliResponse::Config {
@@ -1677,6 +1749,76 @@ fn process_request(request: CliRequest, ctx: &DaemonCtx) -> CliResponse {
                 None => CliResponse::Error {
                     message: format!("folder not in local config: {folder_id_hex}"),
                 },
+            }
+        }
+
+        // -- M31: Sync Progress & Desktop UX Polish --
+        CliRequest::SetFolderColor {
+            folder_id_hex,
+            color_hex,
+        } => {
+            let mut cfg = ctx.config.lock().unwrap();
+            match cfg
+                .folders
+                .iter_mut()
+                .find(|f| f.folder_id == folder_id_hex)
+            {
+                Some(fc) => {
+                    fc.color_hex = color_hex;
+                    persist_config(ctx, &cfg);
+                    CliResponse::Ok {
+                        message: "Folder color updated.".to_string(),
+                    }
+                }
+                None => CliResponse::Error {
+                    message: format!("folder not in local config: {folder_id_hex}"),
+                },
+            }
+        }
+        CliRequest::SetFolderIcon {
+            folder_id_hex,
+            icon,
+        } => {
+            let mut cfg = ctx.config.lock().unwrap();
+            match cfg
+                .folders
+                .iter_mut()
+                .find(|f| f.folder_id == folder_id_hex)
+            {
+                Some(fc) => {
+                    fc.icon = icon;
+                    persist_config(ctx, &cfg);
+                    CliResponse::Ok {
+                        message: "Folder icon updated.".to_string(),
+                    }
+                }
+                None => CliResponse::Error {
+                    message: format!("folder not in local config: {folder_id_hex}"),
+                },
+            }
+        }
+        CliRequest::GetNotificationSettings => {
+            let cfg = ctx.config.lock().unwrap();
+            CliResponse::NotificationSettings {
+                settings: murmur_ipc::NotificationSettingsIpc {
+                    conflict: cfg.notifications.conflict,
+                    transfer_completed: cfg.notifications.transfer_completed,
+                    device_joined: cfg.notifications.device_joined,
+                    error: cfg.notifications.error,
+                },
+            }
+        }
+        CliRequest::SetNotificationSettings { settings } => {
+            let mut cfg = ctx.config.lock().unwrap();
+            cfg.notifications = config::NotificationSettings {
+                conflict: settings.conflict,
+                transfer_completed: settings.transfer_completed,
+                device_joined: settings.device_joined,
+                error: settings.error,
+            };
+            persist_config(ctx, &cfg);
+            CliResponse::Ok {
+                message: "Notification settings updated.".to_string(),
             }
         }
 
@@ -3043,6 +3185,7 @@ mod tests {
             used_invite_nonces: Arc::new(Mutex::new(std::collections::HashSet::new())),
             signing_key: Arc::new(ctx_signing_key),
             device_id,
+            transfer_tracker: Arc::new(TransferTracker::new()),
         }
     }
 
@@ -3432,6 +3575,123 @@ mod tests {
 
         match resp {
             CliResponse::TransferStatus { transfers } => assert!(transfers.is_empty()),
+            other => panic!("expected TransferStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_process_request_notification_settings_roundtrip() {
+        // M31: SetNotificationSettings persists and GetNotificationSettings
+        // returns the stored value.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        let settings = murmur_ipc::NotificationSettingsIpc {
+            conflict: false,
+            transfer_completed: true,
+            device_joined: false,
+            error: true,
+        };
+        let resp = process_request(
+            CliRequest::SetNotificationSettings {
+                settings: settings.clone(),
+            },
+            &ctx,
+        );
+        assert!(matches!(resp, CliResponse::Ok { .. }));
+
+        let got = process_request(CliRequest::GetNotificationSettings, &ctx);
+        match got {
+            CliResponse::NotificationSettings { settings: got } => assert_eq!(got, settings),
+            other => panic!("expected NotificationSettings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_process_request_set_folder_color_and_icon() {
+        // M31: SetFolderColor/SetFolderIcon update the folder's local
+        // config entry and are reflected in GetConfig.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        // Create a folder so there's an entry in config.
+        let local = dir.path().join("sync");
+        std::fs::create_dir_all(&local).unwrap();
+        let resp = process_request(
+            CliRequest::CreateFolder {
+                name: "TestFolder".to_string(),
+                local_path: Some(local.to_string_lossy().to_string()),
+                ignore_patterns: None,
+            },
+            &ctx,
+        );
+        let fid = match resp {
+            CliResponse::Ok { message } => {
+                let s = message.find('(').unwrap();
+                let e = message.find(')').unwrap();
+                message[s + 1..e].to_string()
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        };
+
+        let r1 = process_request(
+            CliRequest::SetFolderColor {
+                folder_id_hex: fid.clone(),
+                color_hex: Some("#4f8cff".to_string()),
+            },
+            &ctx,
+        );
+        assert!(matches!(r1, CliResponse::Ok { .. }));
+        let r2 = process_request(
+            CliRequest::SetFolderIcon {
+                folder_id_hex: fid.clone(),
+                icon: Some("photos".to_string()),
+            },
+            &ctx,
+        );
+        assert!(matches!(r2, CliResponse::Ok { .. }));
+
+        let cfg = process_request(CliRequest::GetConfig, &ctx);
+        match cfg {
+            CliResponse::Config { folders, .. } => {
+                let fc = folders.iter().find(|f| f.folder_id == fid).unwrap();
+                assert_eq!(fc.color_hex.as_deref(), Some("#4f8cff"));
+                assert_eq!(fc.icon.as_deref(), Some("photos"));
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_transfer_status_exposes_tracker_ewma() {
+        // M31: when the transfer tracker has samples, the TransferStatus
+        // IPC surfaces smoothed speed + ETA to clients.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+
+        // Synthesize a blob in storage + push queue so it shows up.
+        // 60 KB total, so a 30s progression at 1 KB/s leaves half remaining
+        // (and therefore an ETA).
+        let data = vec![0u8; 60_000];
+        let blob_hash = murmur_types::BlobHash::from_data(&data);
+        ctx.storage.store_blob(blob_hash, &data).unwrap();
+        ctx.storage.push_queue_add(blob_hash).unwrap();
+
+        for t in 0..=30u64 {
+            ctx.transfer_tracker
+                .record_at(blob_hash, 1000 * t, data.len() as u64, t);
+        }
+
+        let resp = process_request(CliRequest::TransferStatus, &ctx);
+        match resp {
+            CliResponse::TransferStatus { transfers } => {
+                assert_eq!(transfers.len(), 1);
+                let t = &transfers[0];
+                assert_eq!(t.total_bytes, data.len() as u64);
+                assert_eq!(t.bytes_transferred, 30_000);
+                assert!(t.bytes_per_sec_smoothed > 0);
+                assert!(t.eta_seconds.is_some());
+            }
             other => panic!("expected TransferStatus, got {other:?}"),
         }
     }
@@ -4167,6 +4427,7 @@ mod tests {
                 used_invite_nonces: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 signing_key: Arc::new(signing_key.clone()),
                 device_id,
+                transfer_tracker: Arc::new(TransferTracker::new()),
             };
 
             // Create a folder with a local path.
@@ -4255,6 +4516,7 @@ mod tests {
                 used_invite_nonces: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 signing_key: Arc::new(signing_key),
                 device_id,
+                transfer_tracker: Arc::new(TransferTracker::new()),
             };
 
             // Verify folder survives restart.
@@ -4464,6 +4726,8 @@ mod tests {
                 mode: "full".to_string(),
                 auto_resolve: "none".to_string(),
                 conflict_expiry_days: None,
+                color_hex: None,
+                icon: None,
             });
         }
 

@@ -1,6 +1,6 @@
 //! Folders list and folder detail views.
 
-use iced::widget::{button, column, container, row, text, text_input};
+use iced::widget::{button, column, container, progress_bar, row, text, text_input};
 use iced::{Background, Border, Color, Element, Length, Theme};
 
 use crate::app::{App, Screen, SortField};
@@ -341,6 +341,99 @@ impl App {
         ]
         .spacing(6);
 
+        // Appearance (color + icon) — per-device cosmetic settings (M31).
+        let appearance_section = column![
+            text("Appearance").size(14).color(TEXT_SECONDARY),
+            row![
+                text("Color:").size(12).color(TEXT_MUTED),
+                text_input("#4f8cff", &self.folder_color_input)
+                    .on_input(Message::FolderColorInputChanged)
+                    .padding(6)
+                    .width(Length::Fill),
+                button(text("Save").size(12))
+                    .on_press(Message::SaveFolderColor {
+                        folder_id: folder.folder_id.clone(),
+                    })
+                    .style(primary_btn)
+                    .padding(6),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+            row![
+                text("Icon:").size(12).color(TEXT_MUTED),
+                text_input("e.g. photos", &self.folder_icon_input)
+                    .on_input(Message::FolderIconInputChanged)
+                    .padding(6)
+                    .width(Length::Fill),
+                button(text("Save").size(12))
+                    .on_press(Message::SaveFolderIcon {
+                        folder_id: folder.folder_id.clone(),
+                    })
+                    .style(primary_btn)
+                    .padding(6),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+        ]
+        .spacing(6);
+
+        // Transfers in-flight for this folder — smoothed speed/ETA (M31).
+        let mut transfers_section =
+            column![text("Transfers").size(14).color(TEXT_SECONDARY)].spacing(6);
+        if self.transfers.is_empty() {
+            transfers_section = transfers_section
+                .push(text("No transfers in progress.").size(12).color(TEXT_MUTED));
+        } else {
+            for t in &self.transfers {
+                let total = t.total_bytes.max(1) as f32;
+                let done = (t.bytes_transferred as f32).min(total);
+                let pct = if t.total_bytes == 0 {
+                    0.0
+                } else {
+                    (done / total).clamp(0.0, 1.0)
+                };
+                let speed = if t.bytes_per_sec_smoothed == 0 {
+                    "--".to_string()
+                } else {
+                    format!("{}/s", format_size(t.bytes_per_sec_smoothed))
+                };
+                let eta = match t.eta_seconds {
+                    None => "--".to_string(),
+                    Some(s) if s < 60 => format!("{s}s"),
+                    Some(s) if s < 3600 => format!("{} min", s / 60),
+                    Some(s) => format!("{} h", s / 3600),
+                };
+                let short_hash = if t.blob_hash.len() > 12 {
+                    &t.blob_hash[..12]
+                } else {
+                    &t.blob_hash
+                };
+                transfers_section = transfers_section.push(
+                    column![
+                        row![
+                            text(short_hash.to_string())
+                                .size(11)
+                                .color(TEXT_MUTED)
+                                .width(Length::Fill),
+                            text(format!(
+                                "{} / {} — {} — ~{} remaining",
+                                format_size(t.bytes_transferred),
+                                format_size(t.total_bytes),
+                                speed,
+                                eta,
+                            ))
+                            .size(11)
+                            .color(TEXT_SECONDARY),
+                        ]
+                        .spacing(6)
+                        .align_y(iced::Alignment::Center),
+                        progress_bar(0.0..=1.0, pct),
+                    ]
+                    .spacing(4),
+                );
+            }
+        }
+
         // Search & sort
         let search_sort = row![
             text_input("Search files...", &self.search_query)
@@ -465,6 +558,14 @@ impl App {
         column![
             header,
             container(info_items)
+                .padding(14)
+                .width(Length::Fill)
+                .style(card_style),
+            container(appearance_section)
+                .padding(14)
+                .width(Length::Fill)
+                .style(card_style),
+            container(transfers_section)
                 .padding(14)
                 .width(Length::Fill)
                 .style(card_style),

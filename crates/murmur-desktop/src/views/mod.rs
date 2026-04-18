@@ -1,5 +1,6 @@
 //! View (rendering) methods for the desktop app screens.
 
+mod activity;
 mod conflicts;
 mod devices;
 mod folders;
@@ -209,6 +210,7 @@ impl App {
                 self.nav_button("\u{2B21}", &devices_label, Screen::Devices),
                 self.nav_button("\u{26A0}", &conflict_label, Screen::Conflicts),
                 self.nav_button("\u{2630}", "Recent Files", Screen::RecentFiles),
+                self.nav_button("\u{23F1}", "Activity", Screen::Activity),
                 self.nav_button("\u{2261}", "Status", Screen::Status),
                 // Push bottom section down
                 Space::new().height(Length::Fill),
@@ -270,6 +272,7 @@ impl App {
             Screen::RecentFiles => self.view_recent_files(),
             Screen::Settings => self.view_settings(),
             Screen::NetworkHealth => self.view_network_health(),
+            Screen::Activity => self.view_activity(),
             Screen::DaemonCheck | Screen::Setup => unreachable!(),
         };
 

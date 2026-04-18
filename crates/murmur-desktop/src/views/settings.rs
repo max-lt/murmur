@@ -5,7 +5,7 @@ use iced::{Color, Element, Length, Theme};
 
 use crate::app::App;
 use crate::helpers::{format_size, truncate_hex};
-use crate::message::Message;
+use crate::message::{Message, NotificationKind};
 use crate::style::*;
 
 impl App {
@@ -210,6 +210,49 @@ impl App {
         .width(Length::Fill)
         .style(card_style);
         col = col.push(sync_card);
+
+        // Notifications card (M31)
+        let notif_row = |label: &str, on: bool, kind: NotificationKind| {
+            row![
+                text(label.to_string())
+                    .size(14)
+                    .color(Color::WHITE)
+                    .width(Length::Fill),
+                button(text(if on { "ON" } else { "OFF" }).size(13))
+                    .on_press(Message::ToggleNotification(kind))
+                    .style(if on {
+                        primary_btn as fn(&Theme, button::Status) -> button::Style
+                    } else {
+                        secondary_btn
+                    })
+                    .padding(6),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+        };
+        let s = &self.notification_settings;
+        let notif_card = container(
+            column![
+                text("Notifications").size(16).color(TEXT_SECONDARY),
+                notif_row("Conflicts", s.conflict, NotificationKind::Conflict),
+                notif_row(
+                    "Transfer completed",
+                    s.transfer_completed,
+                    NotificationKind::TransferCompleted,
+                ),
+                notif_row(
+                    "Device joined",
+                    s.device_joined,
+                    NotificationKind::DeviceJoined,
+                ),
+                notif_row("Errors", s.error, NotificationKind::Error),
+            ]
+            .spacing(6),
+        )
+        .padding(14)
+        .width(Length::Fill)
+        .style(card_style);
+        col = col.push(notif_card);
 
         // Danger zone card
         let mut danger_items = column![text("Danger Zone").size(16).color(ERROR)].spacing(8);

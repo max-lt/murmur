@@ -74,9 +74,11 @@ trap cleanup EXIT
 # Start a daemon in the background.
 # Writes PID to $TESTDIR/.last_pid. Returns 0 on success, 1 on failure.
 start_daemon() {
-    local dir="$1" name="$2" role="${3:-full}"
+    # Third arg (role) is legacy — retained for call-site compatibility but
+    # ignored, since murmurd no longer accepts `--role`.
+    local dir="$1" name="$2"
     mkdir -p "$dir"
-    "$MURMURD" --data-dir "$dir" --name "$name" --role "$role" \
+    "$MURMURD" --data-dir "$dir" --name "$name" \
         >"$TESTDIR/.daemon-${name}.log" 2>&1 &
     local pid=$!
     local waited=0
@@ -192,22 +194,22 @@ MNEMONIC_JSON_VAL=$(jq_get "$MNEMONIC_JSON" "d['Mnemonic']['mnemonic']")
 
 # B8 — Join offline
 echo "--- B8–B11: Join & Validation ---"
-JOIN_OUT=$(cli --data-dir "$DIR_B" join "$MNEMONIC" --name "node-b" --role backup)
+JOIN_OUT=$(cli --data-dir "$DIR_B" join "$MNEMONIC" --name "node-b")
 echo "$JOIN_OUT" | grep -q "Joined Murmur network" \
     && pass "B8 — join succeeded" || fail "B8" "$JOIN_OUT"
 [ -f "$DIR_B/config.toml" ] && [ -f "$DIR_B/mnemonic" ] && [ -f "$DIR_B/device.key" ] \
     && pass "B8 — config/mnemonic/key created" || fail "B8" "missing files"
 
 # B9 — Invalid mnemonic
-BAD_EXIT=$(cli_exit --data-dir "$TESTDIR/bad" join "not a valid mnemonic" --name "x" --role backup | tail -1)
+BAD_EXIT=$(cli_exit --data-dir "$TESTDIR/bad" join "not a valid mnemonic" --name "x" | tail -1)
 [ "$BAD_EXIT" -ne 0 ] && pass "B9 — bad mnemonic rejected" || fail "B9" "accepted"
 
-# B10 — Invalid role
+# B10 — Legacy `--role` flag is no longer recognised; clap should reject it.
 BAD_EXIT=$(cli_exit --data-dir "$TESTDIR/bad" join "$MNEMONIC" --name "x" --role superadmin | tail -1)
-[ "$BAD_EXIT" -ne 0 ] && pass "B10 — bad role rejected" || fail "B10" "accepted"
+[ "$BAD_EXIT" -ne 0 ] && pass "B10 — legacy --role flag rejected" || fail "B10" "accepted"
 
 # B11 — Double init
-DOUBLE_EXIT=$(cli_exit --data-dir "$DIR_B" join "$MNEMONIC" --name "x" --role backup | tail -1)
+DOUBLE_EXIT=$(cli_exit --data-dir "$DIR_B" join "$MNEMONIC" --name "x" | tail -1)
 [ "$DOUBLE_EXIT" -ne 0 ] && pass "B11 — double init rejected" || fail "B11" "allowed"
 
 # B12 — Start Node B
@@ -226,7 +228,7 @@ NODE_B_ID=$(echo "$PENDING_PLAIN" | awk '/node-b/{print $1}' | head -1)
 
 # B14 — Approve
 if [ -n "$NODE_B_ID" ]; then
-    APPROVE_OUT=$(cli --data-dir "$DIR_A" approve "$NODE_B_ID" --role backup)
+    APPROVE_OUT=$(cli --data-dir "$DIR_A" approve "$NODE_B_ID")
     echo "$APPROVE_OUT" | grep -qi "approved\|ok\|success" \
         && pass "B14 — device approved" || fail "B14" "$APPROVE_OUT"
 else
@@ -377,18 +379,18 @@ if [ -n "$PHOTOS_FOLDER_ID" ]; then
         && pass "I9 — subscribed to photos" || fail "I9" "$SUB"
     PHOTOS_MODE=$(jq_get "$(cli --data-dir "$DIR_B" folder list --json)" \
         "next((f.get('mode') for f in d['Folders']['folders'] if f['name']=='photos'), None)")
-    [ "$PHOTOS_MODE" = "read-write" ] \
-        && pass "I9 — default mode is read-write" || fail "I9" "mode=$PHOTOS_MODE"
+    [ "$PHOTOS_MODE" = "full" ] \
+        && pass "I9 — default mode is full" || fail "I9" "mode=$PHOTOS_MODE"
 else
     skip "I9" "no photos folder ID"
 fi
 
 if [ -n "$DOCUMENTS_FOLDER_ID" ]; then
-    cli --data-dir "$DIR_B" folder subscribe "$DOCUMENTS_FOLDER_ID" "$TESTDIR/b-docs" --read-only >/dev/null
+    cli --data-dir "$DIR_B" folder subscribe "$DOCUMENTS_FOLDER_ID" "$TESTDIR/b-docs" --mode receive-only >/dev/null
     DOC_MODE=$(jq_get "$(cli --data-dir "$DIR_B" folder list --json)" \
         "next((f.get('mode') for f in d['Folders']['folders'] if f['name']=='documents'), None)")
-    [ "$DOC_MODE" = "read-only" ] \
-        && pass "I10 — documents subscribed read-only" || fail "I10" "mode=$DOC_MODE"
+    [ "$DOC_MODE" = "receive-only" ] \
+        && pass "I10 — documents subscribed receive-only" || fail "I10" "mode=$DOC_MODE"
 else
     skip "I10" "no documents folder ID"
 fi
@@ -400,14 +402,14 @@ SNONE_EXIT=$(cli_exit --data-dir "$DIR_B" folder subscribe "$BAD_FID" "$TESTDIR/
 
 # I12 — Change mode
 if [ -n "$PHOTOS_FOLDER_ID" ]; then
-    MODE_OUT=$(cli --data-dir "$DIR_B" folder mode "$PHOTOS_FOLDER_ID" read-only)
+    MODE_OUT=$(cli --data-dir "$DIR_B" folder mode "$PHOTOS_FOLDER_ID" receive-only)
     echo "$MODE_OUT" | grep -qi "mode\|ok\|success\|changed" \
-        && pass "I12 — mode changed to read-only" || fail "I12" "$MODE_OUT"
-    cli --data-dir "$DIR_B" folder mode "$PHOTOS_FOLDER_ID" read-write >/dev/null
+        && pass "I12 — mode changed to receive-only" || fail "I12" "$MODE_OUT"
+    cli --data-dir "$DIR_B" folder mode "$PHOTOS_FOLDER_ID" full >/dev/null
     BACK_MODE=$(jq_get "$(cli --data-dir "$DIR_B" folder list --json)" \
         "next((f.get('mode') for f in d['Folders']['folders'] if f['name']=='photos'), None)")
-    [ "$BACK_MODE" = "read-write" ] \
-        && pass "I12 — mode restored to read-write" || fail "I12" "mode=$BACK_MODE"
+    [ "$BACK_MODE" = "full" ] \
+        && pass "I12 — mode restored to full" || fail "I12" "mode=$BACK_MODE"
 else
     skip "I12" "no photos folder ID"
 fi
@@ -487,15 +489,15 @@ OFF_CNT=$(cli --data-dir "$DIR_B" files | grep -c "test-off" || echo "0")
 
 # I23–I26 — Conflicts
 echo "--- I23–I26: Conflicts ---"
-cli --data-dir "$DIR_A" conflicts | grep -qi "no active conflicts" \
+cli --data-dir "$DIR_A" conflicts list | grep -qi "no active conflicts" \
     && pass "I23 — no conflicts" || fail "I23" "unexpected conflicts"
 
-CONFL_JSON=$(cli --data-dir "$DIR_A" conflicts --json)
+CONFL_JSON=$(cli --data-dir "$DIR_A" --json conflicts list)
 jq_get "$CONFL_JSON" "'ok' if 'conflicts' in d['Conflicts'] else 'fail'" | grep -q "ok" \
     && pass "I24 — conflicts JSON valid" || fail "I24" "JSON invalid"
 
 if [ -n "$DEFAULT_FOLDER_ID" ]; then
-    cli --data-dir "$DIR_A" conflicts --folder "$DEFAULT_FOLDER_ID" | grep -qi "conflict" \
+    cli --data-dir "$DIR_A" conflicts list --folder "$DEFAULT_FOLDER_ID" | grep -qi "conflict" \
         && pass "I25 — folder-filtered conflicts works" || fail "I25" "no response"
 else
     skip "I25" "no default folder ID"
@@ -612,14 +614,14 @@ REVOKE_NONE=$(cli --data-dir "$DIR_A" revoke "$BAD_FID")
 echo "$REVOKE_NONE" | grep -qi "error\|not found\|no such" \
     && pass "A4 — revoke non-existent returns error" || fail "A4" "$REVOKE_NONE"
 
-APP_HEX=$(cli_exit --data-dir "$DIR_A" approve "not-hex" --role backup | tail -1)
+APP_HEX=$(cli_exit --data-dir "$DIR_A" approve "not-hex" | tail -1)
 [ "$APP_HEX" -ne 0 ] && pass "A5 — approve invalid hex rejected" || fail "A5" "exit=0"
 
 # A7 — Re-join after revocation
 echo "--- A7: Re-join After Revocation ---"
 stop_daemon "$DAEMON_B_PID"; DAEMON_B_PID=""; sleep 1
 rm -rf "$DIR_B"
-cli --data-dir "$DIR_B" join "$MNEMONIC" --name "node-b-v2" --role full >/dev/null
+cli --data-dir "$DIR_B" join "$MNEMONIC" --name "node-b-v2" >/dev/null
 start_daemon "$DIR_B" "node-b-v2" "full" && DAEMON_B_PID=$(last_pid) || DAEMON_B_PID=""
 sleep 6
 PENDING_REJOIN=$(cli --data-dir "$DIR_A" pending)
@@ -627,7 +629,7 @@ echo "$PENDING_REJOIN" | grep -q "node-b-v2" \
     && pass "A7 — node-b-v2 pending" || fail "A7" "$PENDING_REJOIN"
 NEW_B_ID=$(echo "$PENDING_REJOIN" | awk '/node-b-v2/{print $1}' | head -1)
 if [ -n "$NEW_B_ID" ]; then
-    cli --data-dir "$DIR_A" approve "$NEW_B_ID" --role full >/dev/null
+    cli --data-dir "$DIR_A" approve "$NEW_B_ID" >/dev/null
     sleep 6
     cli --data-dir "$DIR_A" devices | grep -q "node-b-v2" \
         && pass "A7 — node-b-v2 approved" || fail "A7" "not in devices"

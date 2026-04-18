@@ -712,8 +712,21 @@ fn print_plain(response: &CliResponse) {
                     } else {
                         0.0
                     };
+                    // M31: surface smoothed speed / ETA when the daemon has
+                    // seen progress samples for this blob. "--" when unknown.
+                    let speed = if t.bytes_per_sec_smoothed == 0 {
+                        "-- B/s".to_string()
+                    } else {
+                        format!("{} B/s", t.bytes_per_sec_smoothed)
+                    };
+                    let eta = match t.eta_seconds {
+                        None => "--".to_string(),
+                        Some(s) if s < 60 => format!("{s}s"),
+                        Some(s) if s < 3600 => format!("{} min", s / 60),
+                        Some(s) => format!("{} h", s / 3600),
+                    };
                     println!(
-                        "  {} {}/{} bytes ({pct:.0}%)",
+                        "  {} {}/{} bytes ({pct:.0}%) — {speed} — ~{eta} remaining",
                         t.blob_hash, t.bytes_transferred, t.total_bytes
                     );
                 }
@@ -963,6 +976,18 @@ fn print_plain(response: &CliResponse) {
                 "ConflictDiff (is_text={is_text}): {} ({} bytes) vs {} ({} bytes)",
                 left.device_name, left.size, right.device_name, right.size
             );
+        }
+        // M31: per-event notification preferences.
+        CliResponse::NotificationSettings { settings } => {
+            let fmt = |b: bool| if b { "on" } else { "off" };
+            println!("Notification settings:");
+            println!("  conflict:            {}", fmt(settings.conflict));
+            println!(
+                "  transfer_completed:  {}",
+                fmt(settings.transfer_completed)
+            );
+            println!("  device_joined:       {}", fmt(settings.device_joined));
+            println!("  error:               {}", fmt(settings.error));
         }
     }
 }

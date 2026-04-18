@@ -135,4 +135,45 @@ pub enum Message {
     SaveFolderConflictExpiry(String),
     DaemonEvent(CliResponse),
     Tick,
+    // M31: Sync Progress & Desktop UX Polish
+    /// Response from `GetNotificationSettings`.
+    GotNotificationSettings(Result<CliResponse, String>),
+    /// Toggle one per-event notification flag and persist.
+    ToggleNotification(NotificationKind),
+    /// Response from `TransferStatus`.
+    GotTransfers(Result<CliResponse, String>),
+    /// A single file was dropped onto the window (M31).
+    ///
+    /// iced emits one event per file even on multi-file drops. The handler
+    /// routes the path to the currently-selected folder (no-op otherwise)
+    /// and copies the file into that folder's local directory; the folder
+    /// watcher then picks it up through forward sync.
+    FolderFileDropped(PathBuf),
+    /// User typed a hex color in the folder-detail color input.
+    FolderColorInputChanged(String),
+    /// User typed an icon slug/emoji in the folder-detail icon input.
+    FolderIconInputChanged(String),
+    /// Persist the current folder's color.
+    SaveFolderColor {
+        /// Folder ID (hex).
+        folder_id: String,
+    },
+    /// Persist the current folder's icon.
+    SaveFolderIcon {
+        /// Folder ID (hex).
+        folder_id: String,
+    },
+}
+
+/// Per-event notification flag, used by [`Message::ToggleNotification`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationKind {
+    /// Conflict detected / auto-resolved.
+    Conflict,
+    /// Transfer completed.
+    TransferCompleted,
+    /// Device joined or was approved.
+    DeviceJoined,
+    /// Error events.
+    Error,
 }

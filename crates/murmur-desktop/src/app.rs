@@ -6,7 +6,8 @@ use iced::{Color, Task, Theme};
 
 use murmur_ipc::{
     CliRequest, ConflictDiffSide, ConflictInfoIpc, DeviceInfoIpc, DevicePresenceIpc, FileInfoIpc,
-    FileVersionIpc, FolderInfoIpc, FolderSubscriberIpc, NetworkFolderInfoIpc, PeerInfoIpc,
+    FileVersionIpc, FolderInfoIpc, FolderSubscriberIpc, NetworkFolderInfoIpc,
+    NotificationSettingsIpc, PeerInfoIpc, TransferInfoIpc,
 };
 
 use crate::daemon;
@@ -15,6 +16,9 @@ use crate::message::Message;
 use crate::style;
 
 pub const MAX_EVENT_LOG: usize = 500;
+
+/// Ring-buffer capacity for the activity feed (M31).
+pub const MAX_ACTIVITY_ENTRIES: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -33,6 +37,7 @@ pub enum Screen {
     RecentFiles,
     Settings,
     NetworkHealth,
+    Activity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +120,27 @@ pub struct App {
     pub(crate) folder_auto_resolve_input: String,
     /// Draft text for the current folder's conflict-expiry input (days).
     pub(crate) folder_conflict_expiry_input: String,
+    /// Per-event notification preferences (M31).
+    pub(crate) notification_settings: NotificationSettingsIpc,
+    /// Live transfer snapshot from `TransferStatus` (M31).
+    pub(crate) transfers: Vec<TransferInfoIpc>,
+    /// Ring-buffered activity feed (M31).
+    pub(crate) activity: std::collections::VecDeque<ActivityEntry>,
+    /// Draft text for the current folder's color input (M31).
+    pub(crate) folder_color_input: String,
+    /// Draft text for the current folder's icon input (M31).
+    pub(crate) folder_icon_input: String,
+}
+
+/// One entry in the activity feed (M31).
+#[derive(Debug, Clone)]
+pub struct ActivityEntry {
+    /// Event type string (matches `EngineEventIpc::event_type`).
+    pub event_type: String,
+    /// Human-readable summary shown in the feed.
+    pub summary: String,
+    /// Local monotonic timestamp string for display (HH:MM:SS).
+    pub when: String,
 }
 
 /// Cached conflict diff data (M29).
@@ -202,6 +228,11 @@ impl App {
             expanded_conflict_diffs: std::collections::HashSet::new(),
             folder_auto_resolve_input: String::new(),
             folder_conflict_expiry_input: String::new(),
+            notification_settings: NotificationSettingsIpc::default(),
+            transfers: Vec::new(),
+            activity: std::collections::VecDeque::with_capacity(MAX_ACTIVITY_ENTRIES),
+            folder_color_input: String::new(),
+            folder_icon_input: String::new(),
         };
         let path = app.socket_path.clone();
         (
@@ -223,6 +254,57 @@ impl App {
         self.event_log.push(entry);
     }
 
+    /// Push a tray-style notification only if the matching per-event toggle
+    /// is enabled. Returns `true` if the event was logged (M31).
+    ///
+    /// The "tray" is implemented as `event_log` until a real platform tray
+    /// integration lands — the gating logic is independent of the surface.
+    pub fn push_notification(&mut self, event_type: &str, entry: String) -> bool {
+        if !self.notification_settings_allow(event_type) {
+            return false;
+        }
+        self.push_event(entry);
+        true
+    }
+
+    /// Map an engine-event type string to its notification-settings toggle.
+    ///
+    /// Unknown events default to `true` so new event types surface by default.
+    pub fn notification_settings_allow(&self, event_type: &str) -> bool {
+        let s = &self.notification_settings;
+        match event_type {
+            "conflict_detected" | "conflict_auto_resolved" => s.conflict,
+            "file_synced" | "blob_received" | "blob_transfer_progress" => s.transfer_completed,
+            "device_join_requested" | "device_approved" => s.device_joined,
+            "error" => s.error,
+            _ => true,
+        }
+    }
+
+    /// Record an entry in the chronological activity feed (M31).
+    ///
+    /// Activity feed is always full-fidelity regardless of notification
+    /// preferences — those only gate the tray surface.
+    pub fn push_activity(&mut self, event_type: String, summary: String) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let h = (secs / 3600) % 24;
+        let m = (secs / 60) % 60;
+        let s = secs % 60;
+        let when = format!("{h:02}:{m:02}:{s:02}");
+        if self.activity.len() >= MAX_ACTIVITY_ENTRIES {
+            self.activity.pop_back();
+        }
+        self.activity.push_front(crate::app::ActivityEntry {
+            event_type,
+            summary,
+            when,
+        });
+    }
+
     pub fn theme(&self) -> Theme {
         Theme::custom(
             "Murmur".to_string(),
@@ -242,10 +324,30 @@ impl App {
             iced::Subscription::batch([
                 ipc::event_subscription(self.socket_path.clone()).map(Message::DaemonEvent),
                 iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::Tick),
+                // M31: window file-drop events surface as `FolderFilesDropped`
+                // when the user is on a folder-detail view.
+                iced::event::listen_with(drop_event_filter),
             ])
         } else {
             iced::Subscription::none()
         }
+    }
+}
+
+/// Translate window file-drop events into `Message::FolderFileDropped`.
+///
+/// iced emits one `FileDropped` per path when multiple files are dropped at
+/// once; the update handler routes each to the currently selected folder.
+/// When no folder is selected the event is a no-op.
+fn drop_event_filter(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<Message> {
+    use iced::window::Event as WinEvent;
+    match event {
+        iced::Event::Window(WinEvent::FileDropped(path)) => Some(Message::FolderFileDropped(path)),
+        _ => None,
     }
 }
 
@@ -279,6 +381,8 @@ impl App {
             self.fetch_conflicts(),
             self.fetch_devices(),
             self.fetch_presence(),
+            self.fetch_notification_settings(),
+            self.fetch_transfers(),
         ])
     }
 
@@ -357,5 +461,111 @@ impl App {
             ipc::send(self.socket_path.clone(), CliRequest::StorageStats),
             Message::GotStorageStats,
         )
+    }
+
+    /// Fetch the current per-event notification preferences (M31).
+    pub fn fetch_notification_settings(&self) -> Task<Message> {
+        Task::perform(
+            ipc::send(
+                self.socket_path.clone(),
+                CliRequest::GetNotificationSettings,
+            ),
+            Message::GotNotificationSettings,
+        )
+    }
+
+    /// Fetch the live transfer snapshot (M31).
+    pub fn fetch_transfers(&self) -> Task<Message> {
+        Task::perform(
+            ipc::send(self.socket_path.clone(), CliRequest::TransferStatus),
+            Message::GotTransfers,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new().0
+    }
+
+    #[test]
+    fn test_push_notification_respects_disabled_flags() {
+        // M31: disabled per-event toggles keep the "tray" (event_log) silent
+        // but must still leave the activity feed untouched.
+        let mut a = app();
+        a.notification_settings = NotificationSettingsIpc {
+            conflict: false,
+            transfer_completed: false,
+            device_joined: true,
+            error: true,
+        };
+        assert!(!a.push_notification("conflict_detected", "x".to_string()));
+        assert!(!a.push_notification("file_synced", "y".to_string()));
+        assert!(a.push_notification("device_approved", "z".to_string()));
+        assert_eq!(a.event_log.len(), 1);
+        assert_eq!(a.event_log[0], "z");
+    }
+
+    #[test]
+    fn test_notification_settings_allow_unknown_event_defaults_on() {
+        // Fail-safe: new event types surface until explicitly opted out.
+        let mut a = app();
+        a.notification_settings = NotificationSettingsIpc {
+            conflict: false,
+            transfer_completed: false,
+            device_joined: false,
+            error: false,
+        };
+        assert!(a.notification_settings_allow("future_event_type"));
+    }
+
+    #[test]
+    fn test_push_activity_ring_buffers_newest_first() {
+        // M31: activity feed keeps at most MAX_ACTIVITY_ENTRIES, newest first.
+        let mut a = app();
+        for i in 0..(MAX_ACTIVITY_ENTRIES + 5) {
+            a.push_activity("file_synced".to_string(), format!("e{i}"));
+        }
+        assert_eq!(a.activity.len(), MAX_ACTIVITY_ENTRIES);
+        // Newest pushed last (i = MAX+4) should sit at index 0.
+        let expected_newest = format!("e{}", MAX_ACTIVITY_ENTRIES + 4);
+        assert_eq!(a.activity.front().unwrap().summary, expected_newest);
+    }
+
+    #[test]
+    fn test_push_activity_ignores_notification_settings() {
+        // The activity feed is full-fidelity — toggles don't affect it.
+        let mut a = app();
+        a.notification_settings = NotificationSettingsIpc {
+            conflict: false,
+            transfer_completed: false,
+            device_joined: false,
+            error: false,
+        };
+        a.push_activity("conflict_detected".to_string(), "raw".to_string());
+        assert_eq!(a.activity.len(), 1);
+    }
+
+    #[test]
+    fn test_drop_event_filter_translates_file_dropped() {
+        use std::path::PathBuf;
+        let path = PathBuf::from("/tmp/dropped.bin");
+        let ev = iced::Event::Window(iced::window::Event::FileDropped(path.clone()));
+        let wid = iced::window::Id::unique();
+        let msg = drop_event_filter(ev, iced::event::Status::Ignored, wid);
+        match msg {
+            Some(Message::FolderFileDropped(p)) => assert_eq!(p, path),
+            other => panic!("expected FolderFileDropped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_drop_event_filter_ignores_unrelated_events() {
+        let ev = iced::Event::Window(iced::window::Event::FilesHoveredLeft);
+        let wid = iced::window::Id::unique();
+        assert!(drop_event_filter(ev, iced::event::Status::Ignored, wid).is_none());
     }
 }
